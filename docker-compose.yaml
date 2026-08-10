@@ -4,7 +4,10 @@ services:
     mysql:
         image: mysql:lts
         labels:
-            - 'iobEnabled=${config.dockerMysql.enabled:-true}'
+            # the default must be "false": it is what an instance that has no dockerMysql in its native
+            # config falls back to (e.g. after an upgrade from 3.x), and nobody may get containers created
+            # without asking for them
+            - 'iobEnabled=${config.dockerMysql.enabled:-false}'
             - 'iobStopOnUnload=${config.dockerMysql.stopIfInstanceStopped:-false}'
             - 'iobAutoImageUpdate=${config.dockerMysql.autoImageUpdate:-true}'
             - 'iobBackup=mysql_data'
@@ -27,7 +30,7 @@ services:
     phpMyAdmin:
         image: phpmyadmin:latest
         labels:
-            - 'iobEnabled=${config.dockerPhpMyAdmin.enabled:-true}'
+            - 'iobEnabled=${config.dockerPhpMyAdmin.enabled:-false}'
             - 'iobStopOnUnload=${config.dockerPhpMyAdmin.stopIfInstanceStopped:-true}'
             - 'iobAutoImageUpdate=${config.dockerPhpMyAdmin.autoImageUpdate:-true}'
         container_name: phpmyadmin

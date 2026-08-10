@@ -132,4 +132,78 @@ describe('Test Common functions', function () {
 
         commons.sendResponseCounter(adapter, {}, { start: 5, end: 95 }, timeSeries);
     });
+
+    // "onchange" ("raw" in the e-charts UI) must be passed through untouched. aggregationLogic() has no
+    // branch for it, so running it through the bucket aggregation returns one entry per interval with
+    // val === null - i.e. an empty chart (issue #522).
+    it('Test Common functions: aggregate onchange returns the raw values', function (done) {
+        const start = 1000;
+        const end = 2000;
+        const timeSeries = [
+            { ts: 1000, val: 1 },
+            { ts: 1200, val: 2 },
+            { ts: 1500, val: 3 },
+            { ts: 1800, val: 4 },
+            { ts: 2000, val: 5 },
+        ];
+
+        const adapter = {
+            sendTo: function (from, command, result) {
+                assert.deepStrictEqual(result.result, [
+                    { ts: 1000, val: 1 },
+                    { ts: 1200, val: 2 },
+                    { ts: 1500, val: 3 },
+                    { ts: 1800, val: 4 },
+                    { ts: 2000, val: 5 },
+                ]);
+                assert.strictEqual(result.step, 0);
+                done();
+            },
+            log,
+        };
+
+        commons.sendResponse(
+            adapter,
+            { from: 'system.adapter.test.0', command: 'getHistory' },
+            'test.0.value',
+            { start, end, aggregate: 'onchange', count: 500, limit: 2000, ignoreNull: false },
+            timeSeries,
+            Date.now(),
+        );
+    });
+
+    it('Test Common functions: aggregate onchange draws steps to the borders', function (done) {
+        const start = 1000;
+        const end = 2000;
+        // the value before start and the value after end are delivered by the UNION sub-queries of getHistory
+        const timeSeries = [
+            { ts: 800, val: 1 },
+            { ts: 1200, val: 2 },
+            { ts: 1800, val: 3 },
+            { ts: 2200, val: 4 },
+        ];
+
+        const adapter = {
+            sendTo: function (from, command, result) {
+                // 800 is cut off and becomes the step value at start, 2200 becomes the step value at end
+                assert.deepStrictEqual(result.result, [
+                    { ts: 1000, val: 1 },
+                    { ts: 1200, val: 2 },
+                    { ts: 1800, val: 3 },
+                    { ts: 2000, val: 4 },
+                ]);
+                done();
+            },
+            log,
+        };
+
+        commons.sendResponse(
+            adapter,
+            { from: 'system.adapter.test.0', command: 'getHistory' },
+            'test.0.value',
+            { start, end, aggregate: 'onchange', count: 500, limit: 2000, ignoreNull: false },
+            timeSeries,
+            Date.now(),
+        );
+    });
 });

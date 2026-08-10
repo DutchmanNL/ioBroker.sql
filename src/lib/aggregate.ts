@@ -1431,7 +1431,15 @@ export function sendResponse(
 
         let step = initialOptions.step || 0;
         const sourceLength = data.length;
-        if (!initialOptions.aggregate || initialOptions.aggregate === 'none' || initialOptions.preAggregated) {
+        // "onchange" means "return the raw values" - there is no bucket logic for it in aggregationLogic(),
+        // so it must be passed through here together with "none". Aggregating it would produce one entry per
+        // interval with val === null, i.e. an empty chart.
+        if (
+            !initialOptions.aggregate ||
+            initialOptions.aggregate === 'onchange' ||
+            initialOptions.aggregate === 'none' ||
+            initialOptions.preAggregated
+        ) {
             const options: InternalHistoryOptions = initAggregate(initialOptions, id, undefined, log);
             options.result = data;
             step = 0;
