@@ -1,4 +1,8 @@
 # Older changes
+## 2.2.0 (2022-09-19)
+* IMPORTANT: Node.js 14.x is now needed at a minimum!
+* (Apollon77) Fix potential crash cases with upcoming js-controller versions
+
 ## 2.1.8 (2022-08-13)
 * (riversource/Apollon77) Optimize getHistory query by using "UNION ALL"
 * (Apollon77) Fix crash cases reported by Sentry

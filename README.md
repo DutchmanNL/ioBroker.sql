@@ -546,7 +546,7 @@ sendTo('sql.0', 'getEnabledDPs', {}, function (result) {
 -->
 
 ## Changelog
-### **WORK IN PROGRESS**
+### 4.0.2 (2026-08-10)
 * (@GermanBluefox) Fixed empty charts for the aggregation `onchange` ("raw" in e-charts): it was run through the interval aggregation and returned only `null` values
 * (@GermanBluefox) The MySQL and phpMyAdmin docker containers are no longer enabled by default: instances without the docker settings in their config (e.g. after an update from 3.x) reported "Docker is not installed"
 
@@ -566,10 +566,6 @@ sendTo('sql.0', 'getEnabledDPs', {}, function (result) {
 * (bluefox) Allowed setting port 0 as default
 * (bluefox) Checked if a string is written into the number table
 * (bluefox) Added support for `count` aggregate type on getHistory
-
-### 2.2.0 (2022-09-19)
-* IMPORTANT: Node.js 14.x is now needed at a minimum!
-* (Apollon77) Fix potential crash cases with upcoming js-controller versions
 
 [Older changelogs can be found there](CHANGELOG_OLD.md)
 
