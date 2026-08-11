@@ -546,7 +546,7 @@ sendTo('sql.0', 'getEnabledDPs', {}, function (result) {
 -->
 
 ## Changelog
-### **WORK IN PROGRESS**
+### 4.0.3 (2026-08-11)
 * (@GermanBluefox) Corrected small configuration error
 
 ### 4.0.2 (2026-08-10)
@@ -563,12 +563,6 @@ sendTo('sql.0', 'getEnabledDPs', {}, function (result) {
 
 ### 3.0.1 (2024-06-13)
 * (foxriver76) upgraded dependencies
-
-### 3.0.0 (2023-09-13)
-* IMPORTANT: Node.js 16.x is now needed at a minimum!
-* (bluefox) Allowed setting port 0 as default
-* (bluefox) Checked if a string is written into the number table
-* (bluefox) Added support for `count` aggregate type on getHistory
 
 [Older changelogs can be found there](CHANGELOG_OLD.md)
 

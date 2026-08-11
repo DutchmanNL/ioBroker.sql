@@ -1,4 +1,10 @@
 # Older changes
+## 3.0.0 (2023-09-13)
+* IMPORTANT: Node.js 16.x is now needed at a minimum!
+* (bluefox) Allowed setting port 0 as default
+* (bluefox) Checked if a string is written into the number table
+* (bluefox) Added support for `count` aggregate type on getHistory
+
 ## 2.2.0 (2022-09-19)
 * IMPORTANT: Node.js 14.x is now needed at a minimum!
 * (Apollon77) Fix potential crash cases with upcoming js-controller versions

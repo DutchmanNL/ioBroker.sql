@@ -25,8 +25,21 @@
       "pl": "Rejestrowanie stanów w SQL DB",
       "zh-cn": "将状态记录到SQL DB"
     },
-    "version": "4.0.2",
+    "version": "4.0.3",
     "news": {
+      "4.0.3": {
+        "en": "Corrected small configuration error",
+        "de": "Kleiner Konfigurationsfehler behoben",
+        "ru": "Исправлена небольшая ошибка конфигурации.",
+        "pt": "Pequeno erro de configuração corrigido",
+        "nl": "Een kleine configuratiefout is gecorrigeerd.",
+        "fr": "Correction d'une petite erreur de configuration",
+        "it": "Corretto un piccolo errore di configurazione.",
+        "es": "Se corrigió un pequeño error de configuración.",
+        "pl": "Naprawiono niewielki błąd konfiguracji",
+        "uk": "Виправлено невелику помилку конфігурації",
+        "zh-cn": "修正了一个小的配置错误"
+      },
       "4.0.2": {
         "en": "Fixed empty charts for the aggregation `onchange` (\"raw\" in e-charts): it was run through the interval aggregation and returned only `null` values\nThe MySQL and phpMyAdmin docker containers are no longer enabled by default: instances without the docker settings in their config (e.g. after an update from 3.x) reported \"Docker is not installed\"",
         "de": "Fixed leere Charts für die Aggregation `onchange` (\"roh\" in E-Charts): Es wurde durch die Intervall-Aggregation ausgeführt und nur `null`-Werte zurückgegeben\nDie MySQL- und phpMyAdmin-Dockercontainer sind standardmäßig nicht mehr aktiviert: Instanzen ohne die Dockereinstellungen in ihrer Konfiguration (z. B. nach einem Update von 3.x) meldeten \"Docker ist nicht installiert\"",
@@ -103,18 +116,6 @@
         "es": "IMPORTANTE: Node.js 14.x ahora es necesario al mínimo!\nFijar posibles casos de choque con las próximas versiones js-controller",
         "pl": "IMPORTANT: Nodejs 14.x jest obecnie potrzebny na minimum!\nFix ma problemy z nadchodzącymi wersjami js-controllerowymi",
         "zh-cn": "IMPORTANT: Nodejs 14x现在至少需要!\n九件潜在的事故,即将出版的丛书控制字"
-      },
-      "2.1.8": {
-        "en": "Optimize getHistory query by using \"UNION ALL\"\nFix crash cases reported by Sentry",
-        "de": "Optimieren Sie Geschichte Anfrage mit \"UNION ALL\"\nReparieren Crashfälle gemeldet von Sentry",
-        "ru": "Оптимизируйте получите Запрос истории с помощью \"UNION ALL\"\nИсправление случаев аварии, описанных Sentry",
-        "pt": "Otimizar obter Consulta de história usando \"UNION ALL\"\nCorrigir casos de acidente relatados por Sentry",
-        "nl": "Optimaliseren Vertaling:\nVertaling:",
-        "fr": "Optimiser les résultats Demande d'histoire en utilisant \"UNION ALL\"\nTroubles de crash signalés par Sentry",
-        "it": "Ottimizzare ottenere query di storia utilizzando \"UNION ALL\"\nCorrezione dei casi di crash segnalati da Sentry",
-        "es": "Optimize get Consulta de historia usando \"UNION ALL\"\nCasos de accidente fijo reportados por Sentry",
-        "pl": "Optimizować History query by use the UNION ALL (ang.)\nSprawy katastrofy Fix podane przez Sentry’a",
-        "zh-cn": "A. 全球化 利用“联合国目标”的历史询问\nSentry所报告的六例事故"
       }
     },
     "mode": "daemon",
