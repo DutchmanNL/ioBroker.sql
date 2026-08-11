@@ -3594,7 +3594,11 @@ class SqlAdapter extends adapter_core_1.Adapter {
                         Object.keys(this.sqlDPs).forEach(id => this.sqlDPs[id]?.config &&
                             !this.sqlDPs[id].realId &&
                             this.log.warn(`No realID found for ${id}`));
-                        this.subscribeForeignStates(Object.keys(this.sqlDPs).filter(id => this.sqlDPs[id]?.config && this.sqlDPs[id].realId));
+                        // sqlDPs is keyed by the logging ID, which is the aliasId if one is configured.
+                        // Subscribe to the real state IDs - stateChange maps them back via aliasMap.
+                        this.subscribeForeignStates(Object.keys(this.sqlDPs)
+                            .filter(id => this.sqlDPs[id]?.config && this.sqlDPs[id].realId)
+                            .map(id => this.sqlDPs[id].realId));
                     }
                     else {
                         this.subscribeAll = true;
