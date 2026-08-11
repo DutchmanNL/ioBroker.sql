@@ -349,7 +349,7 @@
         "dockerMysql": {
             "type": "panel",
             "label": "MySQL Docker",
-            "hidden": "!data.dockerMysql.?enabled",
+            "hidden": "!data.dockerMysql?.enabled",
             "items": {
                 "dockerMysql.bind": {
                     "newLine": true,
@@ -392,7 +392,7 @@
         "dockerPhpMyAdmin": {
             "type": "panel",
             "label": "Grafana Docker",
-            "hidden": "!data.dockerPhpMyAdmin.?enabled || !data.dockerMysql.?enabled",
+            "hidden": "!data.dockerPhpMyAdmin?.enabled || !data.dockerMysql?.enabled",
             "items": {
                 "dockerPhpMyAdmin.bind": {
                     "type": "ip",
