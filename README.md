@@ -546,7 +546,7 @@ sendTo('sql.0', 'getEnabledDPs', {}, function (result) {
 -->
 
 ## Changelog
-### **WORK IN PROGRESS**
+### 4.0.4 (2026-08-11)
 * (@GermanBluefox) Fixed that nothing was stored for datapoints with an `aliasId`: the adapter subscribed to the alias name instead of the real state ID, so no state change ever arrived
 
 ### 4.0.3 (2026-08-11)
@@ -563,9 +563,6 @@ sendTo('sql.0', 'getEnabledDPs', {}, function (result) {
 ### 4.0.0 (2026-08-04)
 * (@GermanBluefox) Migrated to TypeScript
 * (@GermanBluefox) Node.js 22 is now needed at a minimum!
-
-### 3.0.1 (2024-06-13)
-* (foxriver76) upgraded dependencies
 
 [Older changelogs can be found there](CHANGELOG_OLD.md)
 

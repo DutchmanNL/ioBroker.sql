@@ -1,4 +1,7 @@
 # Older changes
+## 3.0.1 (2024-06-13)
+* (foxriver76) upgraded dependencies
+
 ## 3.0.0 (2023-09-13)
 * IMPORTANT: Node.js 16.x is now needed at a minimum!
 * (bluefox) Allowed setting port 0 as default

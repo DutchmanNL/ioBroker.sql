@@ -25,8 +25,21 @@
       "pl": "Rejestrowanie stanów w SQL DB",
       "zh-cn": "将状态记录到SQL DB"
     },
-    "version": "4.0.3",
+    "version": "4.0.4",
     "news": {
+      "4.0.4": {
+        "en": "Fixed that nothing was stored for datapoints with an `aliasId`: the adapter subscribed to the alias name instead of the real state ID, so no state change ever arrived",
+        "de": "Es wurde behoben, dass für Datenpunkte mit einer `aliasId` nichts gespeichert wurde: Der Adapter abonnierte den Aliasnamen anstelle der tatsächlichen Status-ID, sodass keine Statusänderung erfasst wurde.",
+        "ru": "Исправлена ошибка, из-за которой для точек данных с `aliasId` ничего не сохранялось: адаптер подписывался на имя псевдонима вместо реального идентификатора состояния, поэтому изменения состояния никогда не поступали.",
+        "pt": "Corrigido o problema em que nada era armazenado para pontos de dados com um `aliasId`: o adaptador se inscrevia no nome do alias em vez do ID de estado real, portanto, nenhuma alteração de estado era registrada.",
+        "nl": "Er is een probleem opgelost waarbij er niets werd opgeslagen voor datapunten met een `aliasId`: de adapter abonneerde zich op de aliasnaam in plaats van de echte status-ID, waardoor er nooit een statuswijziging werd geregistreerd.",
+        "fr": "Correction d'un problème où aucune donnée n'était enregistrée pour les points de données avec un `aliasId` : l'adaptateur s'abonnait au nom de l'alias au lieu de l'identifiant d'état réel, ce qui empêchait la réception des changements d'état.",
+        "it": "Risolto il problema per cui non veniva memorizzato nulla per i punti dati con un `aliasId`: l'adattatore si iscriveva al nome alias invece che all'ID di stato reale, quindi nessuna modifica di stato veniva mai ricevuta",
+        "es": "Se solucionó el problema de que no se almacenaba nada para los puntos de datos con un `aliasId`: el adaptador se suscribía al nombre del alias en lugar del ID de estado real, por lo que nunca llegaba ningún cambio de estado.",
+        "pl": "Naprawiono błąd powodujący, że nic nie było przechowywane dla punktów danych z `aliasId`: adapter subskrybował nazwę aliasu zamiast rzeczywistego identyfikatora stanu, więc żadna zmiana stanu nigdy nie nadeszła",
+        "uk": "Виправлено помилку, через яку нічого не зберігалося для точок даних з `aliasId`: адаптер підписувався на псевдонім замість ідентифікатора реального стану, тому жодної зміни стану ніколи не надходило.",
+        "zh-cn": "修复了对于带有 `aliasId` 的数据点，未存储任何数据的问题：适配器订阅的是别名而不是实际的状态 ID，因此从未收到状态更改通知。"
+      },
       "4.0.3": {
         "en": "Corrected small configuration error",
         "de": "Kleiner Konfigurationsfehler behoben",
@@ -104,18 +117,6 @@
         "pl": "IMPORTANT: Node.js 16.x jest obecnie potrzebny przy minimalnej cenie!\nAllowed Port 0 jako domyślny\nUwaga, czy struna jest zapisywana w tabeli liczbowej",
         "uk": "ВАЖЛИВО: Node.js 16.x тепер потрібен мінімум!\nУсього налаштування порту 0 як за замовчуванням\nПеревірити, якщо рядок записано в номер таблиці",
         "zh-cn": "IMPORTANT: Nodejs 16x现在至少需要!\n允许将港口建为零\n如果在表格编号上写一包,则标示"
-      },
-      "2.2.0": {
-        "en": "IMPORTANT: Node.js 14.x is now needed at minimum!\nFix potential crash cases with upcoming js-controller versions",
-        "de": "WICHTIG: Node.js 14.x wird jetzt mindestens benötigt!\nBeheben Sie mögliche Crash-Fälle mit anstehenden js-Controller-Versionen",
-        "ru": "ВАЖНО: Node.js 14.x теперь нужен минимум!\nИсправление потенциальных кейсов с предстоящими версиями js-controller",
-        "pt": "IMPORTANTE: Node.js 14.x é agora necessário no mínimo!\nCorrigir casos potenciais de acidente com versões js-controller",
-        "nl": "Node is 14.x is nu nodig op minimum!\nVertaling:",
-        "fr": "IMPORTANT: Node.js 14.x est maintenant nécessaire au minimum!\nRéparer les cas de crash potentiels avec les versions de js-controller à venir",
-        "it": "IMPORTANTE: Node.js 14.x è ora necessario al minimo!\nRisolvere potenziali casi di crash con le prossime versioni js-controller",
-        "es": "IMPORTANTE: Node.js 14.x ahora es necesario al mínimo!\nFijar posibles casos de choque con las próximas versiones js-controller",
-        "pl": "IMPORTANT: Nodejs 14.x jest obecnie potrzebny na minimum!\nFix ma problemy z nadchodzącymi wersjami js-controllerowymi",
-        "zh-cn": "IMPORTANT: Nodejs 14x现在至少需要!\n九件潜在的事故,即将出版的丛书控制字"
       }
     },
     "mode": "daemon",
