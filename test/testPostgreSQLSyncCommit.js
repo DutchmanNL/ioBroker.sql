@@ -1,0 +1,133 @@
+/* jshint -W097 */ // jshint strict:false
+/*jslint node: true */
+/*jshint expr: true*/
+const assert = require('node:assert');
+const setup = require('./lib/setup');
+
+let objects = null;
+let states = null;
+let onStateChanged = null;
+let sendToID = 1;
+
+const adapterShortName = setup.adapterName.substring(setup.adapterName.indexOf('.') + 1);
+
+function checkConnectionOfAdapter(cb, counter) {
+    counter ||= 0;
+    if (counter > 20) {
+        cb?.('Cannot check connection');
+        return;
+    }
+
+    states.getState(`system.adapter.${adapterShortName}.0.alive`, (err, state) => {
+        if (err) {
+            console.error(`PostgreSQL:${err}`);
+        }
+        if (state?.val) {
+            cb?.();
+        } else {
+            setTimeout(() => checkConnectionOfAdapter(cb, counter + 1), 1000);
+        }
+    });
+}
+
+function sendTo(target, command, message, callback) {
+    onStateChanged = function (id, state) {
+        if (id === 'messagebox.system.adapter.test.0') {
+            callback(state.message);
+        }
+    };
+
+    states.pushMessage(`system.adapter.${target}`, {
+        command: command,
+        message: message,
+        from: 'system.adapter.test.0',
+        callback: {
+            message: message,
+            id: sendToID++,
+            ack: false,
+            time: new Date().getTime(),
+        },
+    });
+}
+
+// This is a dedicated, minimal suite for the pgSynchronousCommitOff option. It runs the option ON
+// against a stripped-down adapter start so the exact-value data assertions of testPostgreSQL.js
+// (which are sensitive to write/read timing, and thus to how quickly commits return) stay stable.
+describe(`Test ${__filename}`, function () {
+    before(`Test ${__filename} Start js-controller`, function (_done) {
+        this.timeout(600000); // because of first install from npm
+        setup.adapterStarted = false;
+
+        setup.setupController(async function () {
+            const config = await setup.getAdapterConfig();
+            // enable adapter
+            config.common.enabled = true;
+            config.common.loglevel = 'debug';
+
+            config.native.enableDebugLogs = true;
+            config.native.host = '127.0.0.1';
+            config.native.dbtype = 'postgresql';
+            config.native.user = process.env.SQL_USER || 'postgres';
+            config.native.password = process.env.SQL_PASS || '';
+            config.native.pgSynchronousCommitOff = true;
+
+            await setup.setAdapterConfig(config.common, config.native);
+
+            setup.startController(
+                true,
+                function (id, obj) {},
+                function (id, state) {
+                    if (onStateChanged) onStateChanged(id, state);
+                },
+                async (_objects, _states) => {
+                    objects = _objects;
+                    states = _states;
+                    // route adapter responses back to sendTo() (done in preInit for the shared suite)
+                    states.subscribeMessage('system.adapter.test.0');
+                    _done();
+                },
+            );
+        });
+    });
+
+    it(`Test ${__filename}: Check if adapter started`, function (done) {
+        this.timeout(60000);
+        checkConnectionOfAdapter(function (err) {
+            assert.ok(!err, err);
+            // enable one datapoint and let the adapter settle, so the message/response path is fully up
+            sendTo(
+                'sql.0',
+                'enableHistory',
+                {
+                    id: 'system.adapter.sql.0.memHeapTotal',
+                    options: { changesOnly: false, debounce: 0, retention: 31536000, storageType: 'Number' },
+                },
+                function (result) {
+                    assert.strictEqual(result.error, undefined);
+                    assert.strictEqual(result.success, true);
+                    setTimeout(done, 10000);
+                },
+            );
+        });
+    });
+
+    it(`Test ${__filename}: synchronous_commit is off for the adapter's connections`, function (done) {
+        this.timeout(10000);
+
+        sendTo('sql.0', 'query', 'SHOW synchronous_commit', function (result) {
+            console.log(`PostgreSQL synchronous_commit: ${JSON.stringify(result.result)}`);
+            assert.ok(!result.error, `unexpected error: ${result.error}`);
+            assert.strictEqual(result.result[0].synchronous_commit, 'off');
+            done();
+        });
+    });
+
+    after(`Test ${__filename} Stop js-controller`, function (done) {
+        this.timeout(16000);
+
+        setup.stopController(function (normalTerminated) {
+            console.log(`PostgreSQL: Adapter normal terminated: ${normalTerminated}`);
+            setTimeout(done, 2000);
+        });
+    });
+});

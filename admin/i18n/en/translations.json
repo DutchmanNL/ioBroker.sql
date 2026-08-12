@@ -29,6 +29,8 @@
     "Default settings": "Default settings",
     "Disable charting optimized logging of skipped values": "Disable charting optimized logging of skipped values",
     "Do not create database (already created)": "Do not create database (already created)",
+    "Relax PostgreSQL commit durability (synchronous_commit=off)": "Relax PostgreSQL commit durability (synchronous_commit=off)",
+    "Commits no longer wait for the disk flush of the write-ahead log. Strongly reduces disk load and wear. If the PostgreSQL server crashes, the last few hundred milliseconds of stored values can be lost - the database itself cannot be corrupted.": "Commits no longer wait for the disk flush of the write-ahead log. Strongly reduces disk load and wear. If the PostgreSQL server crashes, the last few hundred milliseconds of stored values can be lost - the database itself cannot be corrupted.",
     "Enable enhanced debug logs for the datapoint": "Enable enhanced debug logs for the state",
     "Encrypt": "Encrypt Database connection",
     "Enter a number or leave the field empty": "Enter a number or leave the field empty to not limit the recorded values",

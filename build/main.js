@@ -574,6 +574,12 @@ class SqlAdapter extends adapter_core_1.Adapter {
                         }
                         : undefined,
                 };
+                if (this.config.pgSynchronousCommitOff) {
+                    // Relax commit durability for this adapter's connections only. This cannot corrupt
+                    // the database (unlike fsync=off); a crash of the PostgreSQL server can lose the last
+                    // few hundred milliseconds of committed values.
+                    postgreSQLOptions.options = '-c synchronous_commit=off';
+                }
             }
             else if (this.config.dbtype === 'mssql') {
                 msSQLOptions = {
@@ -3368,6 +3374,7 @@ class SqlAdapter extends adapter_core_1.Adapter {
         if (config.writeNulls === undefined) {
             config.writeNulls = true;
         }
+        config.pgSynchronousCommitOff = !!config.pgSynchronousCommitOff;
         config.retention = parseInt(config.retention, 10) || 0;
         if (config.retention === -1) {
             // Custom timeframe

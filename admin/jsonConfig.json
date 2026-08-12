@@ -145,6 +145,16 @@
                     "md": 4,
                     "lg": 6
                 },
+                "pgSynchronousCommitOff": {
+                    "newLine": true,
+                    "type": "checkbox",
+                    "hidden": "data.dbtype !== 'postgresql' || !!data.dockerMysql?.enabled",
+                    "label": "Relax PostgreSQL commit durability (synchronous_commit=off)",
+                    "help": "Commits no longer wait for the disk flush of the write-ahead log. Strongly reduces disk load and wear. If the PostgreSQL server crashes, the last few hundred milliseconds of stored values can be lost - the database itself cannot be corrupted.",
+                    "sm": 12,
+                    "md": 8,
+                    "lg": 8
+                },
                 "_testConnection": {
                     "newLine": true,
                     "variant": "contained",
