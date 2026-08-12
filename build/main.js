@@ -92,6 +92,7 @@ const SQLFuncs = {
         getFromInsert: PostgreSQL.getFromInsert,
         getCounterDiff: PostgreSQL.getCounterDiff,
         getHistory: PostgreSQL.getHistory,
+        getHistoryAggregate: PostgreSQL.getHistoryAggregate,
         deleteFromTable: PostgreSQL.deleteFromTable,
         update: PostgreSQL.update,
     },
@@ -2845,6 +2846,13 @@ class SqlAdapter extends adapter_core_1.Adapter {
                         error: null,
                     }, msg.callback);
                 }
+                else if (this.#canUseNativeAggregation(msg, options, cacheData.length)) {
+                    // PostgreSQL server-side bucket aggregation (PR-D): compute the per-bucket
+                    // accumulators with GROUP BY in the database and let Node do only the identical
+                    // placement/finishing. Wins over streaming when both apply. Falls back to the Node
+                    // path automatically on nulls-in-range or any error.
+                    this.#getAggregatedDataSql(dbNames[type], options, msg, startTime, debugLog, logId);
+                }
                 else {
                     // Stream the aggregated PostgreSQL read in batches instead of buffering the whole
                     // range in RAM. Only safe when there is no cached RAM data to merge in (cached rows
@@ -3037,6 +3045,179 @@ class SqlAdapter extends adapter_core_1.Adapter {
                 }
                 catch (e) {
                     (0, aggregate_1.sendResponse)(this, msg, options.id, options, e.toString(), startTime);
+                }
+            });
+        });
+    }
+    /**
+     * Decide whether a single-id getHistory can be served by PostgreSQL server-side bucket
+     * aggregation (PR-D). All conditions must hold; otherwise the caller falls through to the
+     * streaming / buffered Node path unchanged.
+     */
+    #canUseNativeAggregation(msg, options, cacheDataLength) {
+        return (this.config.dbtype === 'postgresql' &&
+            this.config.nativeAggregation &&
+            // Undocumented, internal per-request escape hatch read straight off the raw message.
+            // It is NOT part of the typed option set on purpose.
+            !msg.message.options?.preferNodeAggregation &&
+            // Registered only for postgresql; guard like getCounterDiff.
+            !!this.sqlFuncs?.getHistoryAggregate &&
+            this.multiRequests &&
+            !!options.id &&
+            options.index != null &&
+            // numeric datapoint only (0 === number)
+            this.sqlDPs[options.id]?.type === 0 &&
+            !!options.start &&
+            (options.aggregate === 'average' ||
+                options.aggregate === 'min' ||
+                options.aggregate === 'max' ||
+                options.aggregate === 'total' ||
+                options.aggregate === 'count') &&
+            // Unflushed RAM rows would be invisible to SQL, so only when the cache is empty.
+            cacheDataLength === 0);
+    }
+    /**
+     * PostgreSQL server-side bucket aggregation (PR-D).
+     *
+     * The database returns, in ONE statement, the per-bucket accumulators (GROUP BY bucket index)
+     * plus the two raw border rows (last before start, first at/after end). Node then:
+     *   - initializes the aggregator exactly as the Node path (initAggregate),
+     *   - fills options.processing[idx] slots directly from the SQL accumulators (byte-identical to
+     *     what aggregation() would have produced for the in-range rows),
+     *   - feeds the two border rows through the REAL aggregation() (identical border placement),
+     *   - runs the REAL finishAggregation() (finishers + beautify) and the SAME response envelope
+     *     that #getAggregatedDataStreamed sends.
+     *
+     * Because all placement/finishing uses the unchanged aggregator code, output matches the Node
+     * path bit-for-bit whenever this path is taken. On nulls-in-range (whose JS ordering semantics
+     * this SQL does not reproduce) or on ANY error, it falls back to the buffered Node path.
+     */
+    #getAggregatedDataSql(table, options, msg, startTime, debugLog, logId) {
+        // Must be captured before initAggregate mutates options.step (mirrors sendResponse).
+        const responseStep = options.step || 0;
+        // initAggregate below finalizes options.step in place. If we later fall back to the Node path,
+        // its sendResponse captures `step = options.step || 0` BEFORE its own initAggregate, so it must
+        // see the ORIGINAL step (e.g. undefined for a count-based request -> reported step 0), not our
+        // finalized value. Remember it and restore on fallback (PR-B's pristine-options lesson).
+        const origStep = options.step;
+        let log;
+        if (debugLog) {
+            log = (text) => this.log.debug(`${logId}: ${text}`);
+        }
+        // Finalize options.step / options.start / options.maxIndex / processing slots. The SQL is
+        // built AFTER this so it uses the SAME (possibly clamped) step the aggregator uses.
+        const internalOptions = (0, aggregate_1.initAggregate)(options, options.id ?? undefined, undefined, log);
+        const aggType = options.aggregate;
+        const sql = this.sqlFuncs.getHistoryAggregate(this.config.dbname, table, {
+            ...options,
+            index: options.index,
+            start: options.start,
+            end: options.end,
+        });
+        this.log.debug(sql);
+        // One-shot warn on fallback per run.
+        const fallbackToNode = (reason) => {
+            if (debugLog) {
+                this.log.debug(`${logId}: native aggregation fallback (${reason}), using buffered Node path`);
+            }
+            // Restore the pre-initAggregate step so the Node path's sendResponse reports the same
+            // response step it would have without us (initAggregate re-runs there and replaces the
+            // leftover processing arrays anyway; only step is read before that re-init).
+            options.step = origStep;
+            // Same args PR-B uses for its fallback (empty cache, no in-flight).
+            this.#getSingleIdBuffered(table, options, msg, startTime, debugLog, logId, [], false, null);
+        };
+        this.borrowClientFromPool((err, client) => {
+            if (err || !client) {
+                this.returnClientToPool(client);
+                this.log.warn(`${logId}: native aggregation could not borrow a client, using Node path: ${err}`);
+                fallbackToNode('no client');
+                return;
+            }
+            client.execute(sql, (execErr, rows) => {
+                this.returnClientToPool(client);
+                if (execErr || !rows) {
+                    this.log.warn(`${logId}: native aggregation query failed, using Node path: ${execErr}`);
+                    fallbackToNode('query error');
+                    return;
+                }
+                try {
+                    const bucketRows = rows.filter(r => r.k === 0);
+                    const borderRaw = rows.filter(r => r.k === 1 || r.k === 2);
+                    // Nulls in range: their order-dependent JS semantics are not reproduced by this SQL.
+                    let nullsInRange = 0;
+                    for (const r of bucketRows) {
+                        nullsInRange += parseInt(r.cnt_null, 10) || 0;
+                    }
+                    if (nullsInRange > 0) {
+                        fallbackToNode('nulls in range');
+                        return;
+                    }
+                    // No data at all (no in-range buckets, no border rows) == sendResponse's !data[0].
+                    if (!bucketRows.length && !borderRaw.length) {
+                        this.log.info('No Data');
+                        this.sendTo(msg.from, msg.command, { result: [], step: null, sessionId: options.sessionId }, msg.callback);
+                        return;
+                    }
+                    // Fill in-range bucket slots directly, exactly as aggregation() would have.
+                    for (const r of bucketRows) {
+                        const slot = r.slot;
+                        const idx = slot + 1;
+                        const cnt = parseInt(r.cnt, 10) || 0;
+                        if (internalOptions.processing[idx] === undefined) {
+                            // Same lazy slot shape aggregation() creates.
+                            internalOptions.processing[idx] = {
+                                val: { ts: null, val: null },
+                                max: { ts: null, val: null },
+                                min: { ts: null, val: null },
+                                start: { ts: null, val: null },
+                                end: { ts: null, val: null },
+                            };
+                            if (aggType === 'average' || aggType === 'count') {
+                                internalOptions.averageCount[idx] = 0;
+                            }
+                        }
+                        // Bucket-middle timestamp, identical to aggregationLogic().
+                        internalOptions.processing[idx].val.ts = Math.round(internalOptions.start + (idx - 1 + 0.5) * internalOptions.step);
+                        if (aggType === 'average') {
+                            // finisher divides sum by count: val.val = sum, averageCount = count.
+                            internalOptions.processing[idx].val.val = r.s;
+                            internalOptions.averageCount[idx] = cnt;
+                        }
+                        else if (aggType === 'total') {
+                            internalOptions.processing[idx].val.val = r.s;
+                        }
+                        else if (aggType === 'min') {
+                            internalOptions.processing[idx].val.val = r.mn;
+                        }
+                        else if (aggType === 'max') {
+                            internalOptions.processing[idx].val.val = r.mx;
+                        }
+                        else if (aggType === 'count') {
+                            // finisher emits averageCount; count(*) counts ALL rows.
+                            internalOptions.averageCount[idx] = cnt;
+                        }
+                        // Cosmetic parity with aggregation()'s counter (not read by any finisher).
+                        internalOptions.overallLength = (internalOptions.overallLength || 0) + cnt;
+                    }
+                    // Feed the two raw border rows through the REAL aggregation() so border
+                    // placement/interpolation is byte-identical to the Node path.
+                    if (borderRaw.length) {
+                        const borderRows = borderRaw.map(r => ({
+                            ts: r.bts,
+                            val: r.bval,
+                        }));
+                        this.#normalizeRows(borderRows, options);
+                        (0, aggregate_1.aggregation)(internalOptions, borderRows);
+                    }
+                    (0, aggregate_1.finishAggregation)(internalOptions);
+                    const result = internalOptions.result;
+                    this.log.debug(`Send after aggregation (native SQL): ${result?.length} of ${bucketRows.length} buckets in: ${Date.now() - startTime}ms`);
+                    this.sendTo(msg.from, msg.command, { result, step: responseStep, sessionId: options.sessionId }, msg.callback);
+                }
+                catch (e) {
+                    this.log.warn(`${logId}: native aggregation post-processing failed, using Node path: ${e}`);
+                    fallbackToNode('exception');
                 }
             });
         });
@@ -3658,6 +3839,9 @@ class SqlAdapter extends adapter_core_1.Adapter {
             config.writeNulls = true;
         }
         config.pgSynchronousCommitOff = !!config.pgSynchronousCommitOff;
+        // Default ON: PostgreSQL bucket aggregations are computed server-side. Any explicit false
+        // (checkbox unticked) disables it; anything else (undefined / true) keeps it on.
+        config.nativeAggregation = config.nativeAggregation !== false;
         config.writeInterval = parseInt(config.writeInterval, 10) || 0;
         config.retention = parseInt(config.retention, 10) || 0;
         if (config.retention === -1) {

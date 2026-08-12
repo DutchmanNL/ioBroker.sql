@@ -30,6 +30,28 @@ You can leave port 0 if the default port is desired.
 - **Do not create database**: Activate this option if a database already created (e.g. by administrator) and the ioBroker-user does not have enough rights to create a DB.
 - **Relax PostgreSQL commit durability**: PostgreSQL only. Runs the adapter's connections with `synchronous_commit=off`, so commits no longer wait for the write-ahead-log disk flush. This strongly reduces disk I/O and media wear. A crash of the PostgreSQL server can lose the last few hundred milliseconds of stored values; the database itself cannot be corrupted by this setting. Off by default.
 - **Batch write interval (ms)**: PostgreSQL only. `0` (default) writes every value immediately, one commit per value. When set to a positive number of milliseconds, all buffered values across all datapoints are collected in RAM and written together in a single transaction every X ms, so the database performs one commit (and one disk flush) per interval instead of one per value - a large reduction in transaction and fsync load on busy installations. Reads (getHistory) still see buffered values immediately. The trade-off is durability: an unclean crash or power loss can lose at most the last X milliseconds of values. Buffered values are always flushed on a clean adapter stop.
+- **Aggregate in the database**: PostgreSQL only, on by default. Bucket aggregations are computed by the database server instead of transferring every raw row to the adapter (see below). Untick to always aggregate in the adapter's memory.
+
+## PostgreSQL server-side aggregation
+
+When enabled (the default), an aggregated `getHistory` request on PostgreSQL is answered with a single `GROUP BY` query that computes the per-bucket accumulators inside the database. Only one small row per bucket (plus the two border values needed for charting) crosses the wire, so both the network transfer and the adapter's memory stay flat regardless of how many raw values fall into the requested range. The result is identical to the in-memory aggregation - the adapter still performs the exact same bucket placement, border interpolation and rounding on the returned accumulators.
+
+The following aggregate modes are computed server-side:
+
+- `average`
+- `min`
+- `max`
+- `total`
+- `count`
+
+The adapter automatically falls back to the classic in-memory aggregation (with an identical result) when the request cannot be safely computed in SQL, in particular when:
+
+- the DB type is not PostgreSQL, or the option is turned off;
+- there are still unwritten (buffered / in-RAM) values for the datapoint that SQL cannot see;
+- the requested range contains `null` values (their order-dependent handling is not reproduced in SQL);
+- the aggregate mode is not one of the five listed above (`minmax`, `percentile`, `quantile`, `integral`, `integralTotal`, `none`, `onchange`);
+- the request has no start time, targets all datapoints (`*`) or a non-numeric datapoint;
+- the database query or its post-processing fails for any reason.
 
 ## Default Settings
 - **Debounce Time** - Protection against unstable values to make sure that only stable values are logged when the value did not change in the defined amount of Milliseconds. ATTENTION: If values change more often than this setting effectively, no value will be logged (because any value is unstable)
@@ -552,6 +574,7 @@ sendTo('sql.0', 'getEnabledDPs', {}, function (result) {
 * (@DutchmanNL) Fixed getCounter for PostgreSQL: the query used MySQL-style identifiers and always failed with a syntax error
 * (@DutchmanNL) PostgreSQL: added opt-in setting to relax commit durability (synchronous_commit=off) - strongly reduces disk I/O; a crash of the database server can lose the last moments of stored values, the database cannot be corrupted
 * (@DutchmanNL) PostgreSQL: aggregated getHistory reads stream rows in batches instead of buffering the whole range in RAM
+* (@DutchmanNL) PostgreSQL: average/min/max/total/count aggregations are computed by the database server (identical results, far less memory and transfer); disable with the "Aggregate in the database" option
 * (@DutchmanNL) PostgreSQL: added opt-in write batching ("Batch write interval"): buffered values are written together in one transaction every X ms instead of one commit per value (0 = previous behavior)
 * (@DutchmanNL) Buffered values are now reliably written on adapter stop, also when "Write NULL values" is disabled
 

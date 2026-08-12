@@ -155,6 +155,16 @@
                     "md": 8,
                     "lg": 8
                 },
+                "nativeAggregation": {
+                    "newLine": true,
+                    "type": "checkbox",
+                    "hidden": "data.dbtype !== 'postgresql' || !!data.dockerMysql?.enabled",
+                    "label": "Aggregate in the database",
+                    "help": "Compute average/min/max/total/count aggregations directly in PostgreSQL (GROUP BY bucket) instead of transferring every raw row to the adapter. Results are identical; it just uses far less memory and network. The adapter automatically falls back to in-memory aggregation when it is not applicable (e.g. nulls in the range, unbuffered values, or an unsupported aggregate).",
+                    "sm": 12,
+                    "md": 8,
+                    "lg": 8
+                },
                 "writeInterval": {
                     "newLine": true,
                     "type": "number",
