@@ -29,6 +29,7 @@ You can leave port 0 if the default port is desired.
 - **Allow parallel requests**: Allow simultaneous SQL requests to DB.
 - **Do not create database**: Activate this option if a database already created (e.g. by administrator) and the ioBroker-user does not have enough rights to create a DB.
 - **Relax PostgreSQL commit durability**: PostgreSQL only. Runs the adapter's connections with `synchronous_commit=off`, so commits no longer wait for the write-ahead-log disk flush. This strongly reduces disk I/O and media wear. A crash of the PostgreSQL server can lose the last few hundred milliseconds of stored values; the database itself cannot be corrupted by this setting. Off by default.
+- **Batch write interval (ms)**: PostgreSQL only. `0` (default) writes every value immediately, one commit per value. When set to a positive number of milliseconds, all buffered values across all datapoints are collected in RAM and written together in a single transaction every X ms, so the database performs one commit (and one disk flush) per interval instead of one per value - a large reduction in transaction and fsync load on busy installations. Reads (getHistory) still see buffered values immediately. The trade-off is durability: an unclean crash or power loss can lose at most the last X milliseconds of values. Buffered values are always flushed on a clean adapter stop.
 
 ## Default Settings
 - **Debounce Time** - Protection against unstable values to make sure that only stable values are logged when the value did not change in the defined amount of Milliseconds. ATTENTION: If values change more often than this setting effectively, no value will be logged (because any value is unstable)
@@ -551,6 +552,8 @@ sendTo('sql.0', 'getEnabledDPs', {}, function (result) {
 * (@DutchmanNL) Fixed getCounter for PostgreSQL: the query used MySQL-style identifiers and always failed with a syntax error
 * (@DutchmanNL) PostgreSQL: added opt-in setting to relax commit durability (synchronous_commit=off) - strongly reduces disk I/O; a crash of the database server can lose the last moments of stored values, the database cannot be corrupted
 * (@DutchmanNL) PostgreSQL: aggregated getHistory reads stream rows in batches instead of buffering the whole range in RAM
+* (@DutchmanNL) PostgreSQL: added opt-in write batching ("Batch write interval"): buffered values are written together in one transaction every X ms instead of one commit per value (0 = previous behavior)
+* (@DutchmanNL) Buffered values are now reliably written on adapter stop, also when "Write NULL values" is disabled
 
 ### 4.0.4 (2026-08-11)
 * (@GermanBluefox) Fixed that nothing was stored for datapoints with an `aliasId`: the adapter subscribed to the alias name instead of the real state ID, so no state change ever arrived
