@@ -120,6 +120,10 @@ jobs:
 
             - name: Run Postgres tests
               run: node node_modules/mocha/bin/mocha test/testPostgreSQL.js --exit
+
+              # separate mocha process: the test harness supports only one js-controller per process
+            - name: Run Postgres synchronous_commit test
+              run: node node_modules/mocha/bin/mocha test/testPostgreSQLSyncCommit.js --exit
               env:
                   SQL_PASS: postgres
     #      - name: Run unit tests
