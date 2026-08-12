@@ -546,6 +546,9 @@ sendTo('sql.0', 'getEnabledDPs', {}, function (result) {
 -->
 
 ## Changelog
+### **WORK IN PROGRESS**
+* (@DutchmanNL) Fixed getCounter for PostgreSQL: the query used MySQL-style identifiers and always failed with a syntax error
+
 ### 4.0.3 (2026-08-11)
 * (@GermanBluefox) Corrected small configuration error
 
