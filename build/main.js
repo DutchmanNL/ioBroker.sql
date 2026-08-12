@@ -167,6 +167,10 @@ function isEqual(a, b) {
 const MAX_TASKS = 100;
 // Number of rows read per batch when streaming aggregated PostgreSQL getHistory results.
 const STREAM_BATCH_SIZE = 2000;
+// Safety cap on the per-datapoint RAM buffer while time-window write batching is enabled: even before
+// the flush timer fires, a single datapoint is flushed early once its buffered rows exceed this, so a
+// runaway producer cannot grow the buffer without bound between two timer ticks.
+const MAX_BUFFERED_ROWS_PER_DP = 10000;
 function sortByTs(a, b) {
     const aTs = a.ts;
     const bTs = b.ts;
@@ -195,6 +199,8 @@ class SqlAdapter extends adapter_core_1.Adapter {
     postgresDbCreated = false;
     lockTasks = false;
     sqlFuncs = null;
+    /** true after a batched write failed once; a second consecutive failure drops the rows instead of re-queueing */
+    batchWriteFailed = false;
     constructor(options = {}) {
         super({
             ...options,
@@ -1027,7 +1033,6 @@ class SqlAdapter extends adapter_core_1.Adapter {
         }
     }
     finish(callback) {
-        let count = 0;
         const now = Date.now();
         const allFinished = () => {
             if (this.clientPool) {
@@ -1045,9 +1050,14 @@ class SqlAdapter extends adapter_core_1.Adapter {
                 this.finished = true;
             }
         };
-        const finishId = (id) => {
+        // finishId ALWAYS ends by flushing this datapoint's RAM buffer via pushValuesIntoDB, then calls
+        // `done` exactly once. The skipped-value and writeNulls terminators (if configured) are appended to
+        // the buffer first (storeInCacheOnly=true), so the single trailing flush persists them together.
+        // Previously the flush lived only inside the skipped/writeNulls branches, so with writeNulls===false
+        // and no skipped value the buffer was dropped and `done` never fired.
+        const finishId = (id, done) => {
             if (!this.sqlDPs[id]) {
-                return;
+                return done();
             }
             if (this.sqlDPs[id].relogTimeout) {
                 clearTimeout(this.sqlDPs[id].relogTimeout);
@@ -1058,60 +1068,59 @@ class SqlAdapter extends adapter_core_1.Adapter {
                 this.sqlDPs[id].timeout = null;
             }
             const state = this.sqlDPs[id].state ? { ...this.sqlDPs[id].state } : null;
-            if (this.sqlDPs[id].skipped &&
-                !(this.sqlDPs[id].config && this.sqlDPs[id].config.disableSkippedValueLogging)) {
-                count++;
-                this.pushValueIntoDB(id, this.sqlDPs[id].skipped, false, true, () => {
-                    if (!--count) {
-                        this.pushValuesIntoDB(id, this.sqlDPs[id].list, () => {
-                            allFinished();
-                        });
-                    }
-                });
-                this.sqlDPs[id].skipped = null;
-            }
-            const nullValue = {
-                ack: true,
-                val: null,
-                ts: now,
-                lc: now,
-                q: 0x40,
-                from: `system.adapter.${this.namespace}`,
+            // Step 3 (always): write the buffered values. An empty list still calls back (via setImmediate).
+            const flushList = () => {
+                if (!this.sqlDPs[id]) {
+                    return done();
+                }
+                // list may be undefined for a datapoint that never buffered anything (e.g. type resolution
+                // returned early). An empty list still calls back via setImmediate.
+                this.pushValuesIntoDB(id, this.sqlDPs[id].list || [], () => done());
             };
-            if (this.sqlDPs[id].config && this.config.writeNulls) {
-                if (this.sqlDPs[id].config.changesOnly && state && state.val !== null) {
-                    count++;
-                    ((_id, _state, _nullValue) => {
-                        _state.ts = now;
-                        _state.from = `system.adapter.${this.namespace}`;
-                        nullValue.ts += 4;
-                        nullValue.lc += 4; // because of MS SQL
-                        this.log.debug(`Write 1/2 "${_state.val}" _id: ${_id}`);
-                        this.pushValueIntoDB(_id, _state, false, true, () => {
-                            // terminate values with null to indicate adapter stop. timestamp + 1
-                            this.log.debug(`Write 2/2 "null" _id: ${_id}`);
-                            this.pushValueIntoDB(_id, _nullValue, false, true, () => {
-                                if (!--count) {
-                                    this.pushValuesIntoDB(id, this.sqlDPs[id].list, () => {
-                                        allFinished();
-                                    });
-                                }
+            // Step 2 (optional): append the terminating null value(s) to the buffer, then flush.
+            const writeNullsAndFlush = () => {
+                if (this.sqlDPs[id]?.config && this.config.writeNulls) {
+                    const nullValue = {
+                        ack: true,
+                        val: null,
+                        ts: now,
+                        lc: now,
+                        q: 0x40,
+                        from: `system.adapter.${this.namespace}`,
+                    };
+                    if (this.sqlDPs[id].config.changesOnly && state && state.val !== null) {
+                        ((_id, _state, _nullValue) => {
+                            _state.ts = now;
+                            _state.from = `system.adapter.${this.namespace}`;
+                            _nullValue.ts += 4;
+                            _nullValue.lc += 4; // because of MS SQL
+                            this.log.debug(`Write 1/2 "${_state.val}" _id: ${_id}`);
+                            this.pushValueIntoDB(_id, _state, false, true, () => {
+                                // terminate values with null to indicate adapter stop. timestamp + 1
+                                this.log.debug(`Write 2/2 "null" _id: ${_id}`);
+                                this.pushValueIntoDB(_id, _nullValue, false, true, () => flushList());
                             });
-                        });
-                    })(id, state, nullValue);
+                        })(id, state, nullValue);
+                    }
+                    else {
+                        // terminate values with null to indicate adapter stop. timestamp + 1
+                        this.log.debug(`Write 0 NULL _id: ${id}`);
+                        this.pushValueIntoDB(id, nullValue, false, true, () => flushList());
+                    }
                 }
                 else {
-                    // terminate values with null to indicate adapter stop. timestamp + 1
-                    count++;
-                    this.log.debug(`Write 0 NULL _id: ${id}`);
-                    this.pushValueIntoDB(id, nullValue, false, true, () => {
-                        if (!--count) {
-                            this.pushValuesIntoDB(id, this.sqlDPs[id].list, () => {
-                                allFinished();
-                            });
-                        }
-                    });
+                    flushList();
                 }
+            };
+            // Step 1 (optional): append the charting-optimized skipped value to the buffer, then continue.
+            if (this.sqlDPs[id].skipped &&
+                !(this.sqlDPs[id].config && this.sqlDPs[id].config.disableSkippedValueLogging)) {
+                const skipped = this.sqlDPs[id].skipped;
+                this.sqlDPs[id].skipped = null;
+                this.pushValueIntoDB(id, skipped, false, true, () => writeNullsAndFlush());
+            }
+            else {
+                writeNullsAndFlush();
             }
         };
         if (!this.subscribeAll) {
@@ -1154,24 +1163,35 @@ class SqlAdapter extends adapter_core_1.Adapter {
             return;
         }
         this.finished = [callback];
-        let dpcount = 0;
-        let delay = 0;
+        const ids = [];
         for (const id in this.sqlDPs) {
             if (!Object.prototype.hasOwnProperty.call(this.sqlDPs, id)) {
                 continue;
             }
-            dpcount++;
-            delay += dpcount % 50 === 0 ? 1000 : 0;
-            setTimeout(finishId, delay, id);
+            ids.push(id);
         }
-        if (!dpcount && callback) {
-            if (this.clientPool) {
-                this.clientPool.close();
-                this.activeConnections = 0;
-                this.clientPool = null;
-                this.setConnected(false);
+        const dpcount = ids.length;
+        if (!dpcount) {
+            // Nothing to flush: close the pool and fire the finished callbacks exactly once.
+            allFinished();
+            return;
+        }
+        // Count completions so allFinished() (which closes the pool) runs EXACTLY ONCE, after every
+        // datapoint has fully flushed. Previously a single shared counter mutated across staggered
+        // setTimeouts could reach zero while later datapoints were still scheduled, closing the pool early.
+        let remaining = dpcount;
+        const oneDone = () => {
+            if (!--remaining) {
+                allFinished();
             }
-            callback();
+        };
+        // Keep the 50-datapoints-per-1000ms stagger to avoid a connection stampede on shutdown.
+        let dpcounter = 0;
+        let delay = 0;
+        for (const id of ids) {
+            dpcounter++;
+            delay += dpcounter % 50 === 0 ? 1000 : 0;
+            setTimeout(finishId, delay, id, oneDone);
         }
     }
     processMessage(msg) {
@@ -2016,7 +2036,16 @@ class SqlAdapter extends adapter_core_1.Adapter {
             });
             const _settings = this.sqlDPs[id].config || {};
             const maxLength = _settings.maxLength !== undefined ? _settings.maxLength : this.config.maxLength || 0;
-            if ((cb || (_settings && this.sqlDPs[id].list.length > maxLength)) && !storeInCacheOnly) {
+            // When time-window write batching is enabled, the global bufferChecker timer is the flush
+            // driver: a datapoint only flushes early if its own RAM buffer is getting large (respecting an
+            // explicit per-datapoint maxLength, and a hard safety cap otherwise). `cb` still forces a
+            // flush so storeState / disable / shutdown write-through keep working. When writeInterval is 0
+            // the condition below is byte-identical to the previous behaviour.
+            const countTrigger = this.config.writeInterval > 0
+                ? (maxLength > 0 && this.sqlDPs[id].list.length > maxLength) ||
+                    this.sqlDPs[id].list.length > MAX_BUFFERED_ROWS_PER_DP
+                : this.sqlDPs[id].list.length > maxLength;
+            if ((cb || (_settings && countTrigger)) && !storeInCacheOnly) {
                 this.storeCached(id, cb);
             }
             else if (cb && storeInCacheOnly) {
@@ -2025,6 +2054,12 @@ class SqlAdapter extends adapter_core_1.Adapter {
         });
     }
     storeCached(onlyId, cb) {
+        // Time-window write batching: a global flush (no onlyId) writes ALL datapoints together in one
+        // transaction on one connection. Per-id flushes and the SQLite/tasks path (multiRequests === false)
+        // keep the original per-datapoint behaviour untouched.
+        if (onlyId === undefined && this.config.writeInterval > 0 && this.multiRequests) {
+            return this.storeCachedBatch(cb);
+        }
         let count = 0;
         for (const id in this.sqlDPs) {
             if (!Object.prototype.hasOwnProperty.call(this.sqlDPs, id) || (onlyId !== undefined && onlyId !== id)) {
@@ -2057,6 +2092,133 @@ class SqlAdapter extends adapter_core_1.Adapter {
         if (!count && cb) {
             cb();
         }
+    }
+    /**
+     * Flush the RAM buffers of ALL datapoints together in a single transaction on a single connection.
+     *
+     * Only used when time-window write batching is enabled (writeInterval > 0) and the dialect allows
+     * parallel requests. Each datapoint's `list` is moved into a fresh `inFlight` entry - exactly the same
+     * bookkeeping storeCached() uses - so getHistory reads stay complete via the RAM-cache merge while the
+     * write is in flight. The per-datapoint statement arrays from sqlFuncs.insert() are concatenated into
+     * one array; for PostgreSQL a multi-statement batch is wrapped in BEGIN/COMMIT so the whole flush
+     * commits (and fsyncs) once.
+     */
+    storeCachedBatch(cb) {
+        const entries = [];
+        let statements = [];
+        for (const id in this.sqlDPs) {
+            if (!Object.prototype.hasOwnProperty.call(this.sqlDPs, id)) {
+                continue;
+            }
+            const _settings = this.sqlDPs[id].config || {};
+            if (_settings && this.sqlDPs[id]?.list?.length) {
+                if (_settings.enableDebugLogs) {
+                    this.log.debug(`batching ${this.sqlDPs[id].list.length} entries from ${id} to DB`);
+                }
+                const rows = this.sqlDPs[id].list;
+                const inFlightId = `${id}_${Date.now()}_${Math.random()}`;
+                this.sqlDPs[id].inFlight ||= {};
+                this.sqlDPs[id].inFlight[inFlightId] = rows;
+                this.sqlDPs[id].list = [];
+                statements = statements.concat(this.sqlFuncs.insert(this.config.dbname, this.sqlDPs[id].index, rows));
+                entries.push({ id, inFlightId, rowCount: rows.length });
+            }
+        }
+        if (!statements.length) {
+            cb?.();
+            return;
+        }
+        let transactional = false;
+        if (this.config.dbtype === 'postgresql' && statements.length > 1) {
+            statements = ['BEGIN;', ...statements, 'COMMIT;'];
+            transactional = true;
+        }
+        this._insertValuesBatchIntoDB(statements, entries, transactional, cb || undefined);
+    }
+    /**
+     * Run one batched write on a single borrowed connection.
+     *
+     * Modelled on _insertValuesIntoDB (statements run serially via a `next(i)` recursion), but a separate
+     * method on purpose: with a prepended BEGIN a mid-batch failure leaves an OPEN, ABORTED transaction on
+     * the session. _insertValuesIntoDB returns the client to the pool as-is, which would poison the next
+     * borrower; here we ROLLBACK first. `entries` carries the per-datapoint inFlight bookkeeping so the
+     * rows can be re-queued (first failure) or dropped (second consecutive failure).
+     */
+    _insertValuesBatchIntoDB(queries, entries, transactional, cb) {
+        const totalRows = entries.reduce((sum, entry) => sum + entry.rowCount, 0);
+        const requeueOrDrop = (err) => {
+            if (!this.batchWriteFailed) {
+                // First failure: put the rows back at the FRONT of each datapoint's list so the next timer
+                // tick retries them. Front-concat keeps chronological order (buffered rows precede rows that
+                // arrived while the write was in flight). The retry is idempotent: inserts carry
+                // ON CONFLICT DO NOTHING, and a duplicate ts_counter row is de-duplicated by getCounterDiff.
+                this.batchWriteFailed = true;
+                for (const entry of entries) {
+                    const dp = this.sqlDPs[entry.id];
+                    if (dp?.inFlight?.[entry.inFlightId]) {
+                        dp.list = dp.inFlight[entry.inFlightId].concat(dp.list);
+                        delete dp.inFlight[entry.inFlightId];
+                    }
+                }
+                this.log.warn(`Cannot write batch of ${totalRows} values, re-queued for next flush: ${err}`);
+            }
+            else {
+                // Second consecutive failure: drop the rows without re-queue to avoid unbounded RAM growth.
+                for (const entry of entries) {
+                    const dp = this.sqlDPs[entry.id];
+                    if (dp?.inFlight?.[entry.inFlightId]) {
+                        delete dp.inFlight[entry.inFlightId];
+                    }
+                }
+                this.log.error(`Cannot write batch of ${totalRows} values twice in a row, dropped: ${err}`);
+            }
+            cb?.(err);
+        };
+        this.borrowClientFromPool((err, client) => {
+            if (err || !client) {
+                this.returnClientToPool(client);
+                requeueOrDrop(err instanceof Error ? err : new Error('No database connection'));
+                return;
+            }
+            const finalizeError = (execErr) => {
+                if (transactional) {
+                    // Roll back the aborted transaction, then return the client regardless of the rollback
+                    // outcome, so a broken session is not reused with an open transaction.
+                    client.execute('ROLLBACK;', () => {
+                        this.returnClientToPool(client);
+                        requeueOrDrop(execErr);
+                    });
+                }
+                else {
+                    this.returnClientToPool(client);
+                    requeueOrDrop(execErr);
+                }
+            };
+            const next = (i) => {
+                if (i >= queries.length) {
+                    this.returnClientToPool(client);
+                    this.batchWriteFailed = false;
+                    for (const entry of entries) {
+                        if (this.sqlDPs[entry.id]?.inFlight?.[entry.inFlightId]) {
+                            delete this.sqlDPs[entry.id].inFlight[entry.inFlightId];
+                        }
+                        this.checkRetention(entry.id);
+                    }
+                    cb?.();
+                    return;
+                }
+                this.log.debug(queries[i]);
+                client.execute(queries[i], (execErr /* , rows, fields */) => {
+                    if (execErr) {
+                        this.log.error(`Cannot insert ${queries[i]}: ${execErr}`);
+                        finalizeError(execErr instanceof Error ? execErr : new Error(String(execErr)));
+                        return;
+                    }
+                    next(i + 1);
+                });
+            };
+            next(0);
+        });
     }
     pushValuesIntoDB(id, list, cb) {
         if (!list.length) {
@@ -3496,6 +3658,7 @@ class SqlAdapter extends adapter_core_1.Adapter {
             config.writeNulls = true;
         }
         config.pgSynchronousCommitOff = !!config.pgSynchronousCommitOff;
+        config.writeInterval = parseInt(config.writeInterval, 10) || 0;
         config.retention = parseInt(config.retention, 10) || 0;
         if (config.retention === -1) {
             // Custom timeframe
@@ -3736,8 +3899,10 @@ class SqlAdapter extends adapter_core_1.Adapter {
                     this.log.debug('Initialization done');
                     this.setConnected(true);
                     this.processStartValues();
-                    // store all buffered data every 10 minutes to not lost the data
-                    this.bufferChecker = setInterval(() => this.storeCached(), 10 * 60000);
+                    // Store all buffered data periodically so it is not lost. With write batching enabled
+                    // (writeInterval > 0) this same timer is the flush driver and runs every writeInterval
+                    // ms; otherwise it is only the 10-minute safety flush. finish() clears this handle.
+                    this.bufferChecker = setInterval(() => this.storeCached(), this.config.writeInterval > 0 ? this.config.writeInterval : 10 * 60000);
                 });
             });
         }

@@ -155,6 +155,17 @@
                     "md": 8,
                     "lg": 8
                 },
+                "writeInterval": {
+                    "newLine": true,
+                    "type": "number",
+                    "hidden": "data.dbtype !== 'postgresql' || !!data.dockerMysql?.enabled",
+                    "label": "Batch write interval (ms)",
+                    "help": "0 = write every value immediately (default). When set, all buffered values are written together in one transaction every X milliseconds. An unclean crash or power loss can lose at most the last X milliseconds of values.",
+                    "min": 0,
+                    "sm": 12,
+                    "md": 4,
+                    "lg": 4
+                },
                 "_testConnection": {
                     "newLine": true,
                     "variant": "contained",
