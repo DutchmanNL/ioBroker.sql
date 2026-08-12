@@ -1,5 +1,5 @@
 import { Adapter, type AdapterOptions, getAbsoluteDefaultDataDir } from '@iobroker/adapter-core'; // Get common adapter utils
-import { sendResponseCounter, sendResponse } from './lib/aggregate';
+import { sendResponseCounter, sendResponse, initAggregate, aggregation, finishAggregation } from './lib/aggregate';
 import { existsSync, mkdirSync } from 'node:fs';
 import { join, normalize } from 'node:path';
 
@@ -23,7 +23,7 @@ import { PostgreSQLClientPool, PostgreSQLClient, type PostgreSQLOptions } from '
 import { SQLite3ClientPool, SQLite3Client, type SQLite3Options } from './lib/sqlite3-client';
 import type { SQLClientPool, PoolConfig } from './lib/sql-client-pool';
 import type SQLClient from './lib/sql-client';
-import type { IobDataEntry } from './lib/types';
+import type { IobDataEntry, InternalHistoryOptions } from './lib/types';
 
 export interface IobDataEntryEx extends Omit<IobDataEntry, 'val'> {
     val: string | boolean | number | null;
@@ -210,6 +210,9 @@ function isEqual(a: any, b: any): boolean {
 }
 
 const MAX_TASKS = 100;
+
+// Number of rows read per batch when streaming aggregated PostgreSQL getHistory results.
+const STREAM_BATCH_SIZE = 2000;
 
 type SQLPointConfig = {
     realId: string;
@@ -2840,32 +2843,44 @@ export class SqlAdapter extends Adapter {
                 this.returnClientToPool(client);
 
                 if (!err && rows) {
-                    for (let c = 0; c < rows.length; c++) {
-                        if (typeof rows[c].ts === 'string') {
-                            rows[c].ts = parseInt(rows[c].ts as unknown as string, 10);
-                        }
-
-                        if (this.common?.loglevel === 'debug') {
-                            rows[c].date = new Date(rows[c].ts);
-                        }
-                        if (options.ack) {
-                            rows[c].ack = !!rows[c].ack;
-                        }
-                        if (typeof rows[c].val === 'number' && isFinite(rows[c].val as any) && options.round) {
-                            rows[c].val = Math.round((rows[c].val as number) * options.round) / options.round;
-                        }
-                        if (options.id && this.sqlDPs[options.id] && this.sqlDPs[options.id].type === 2) {
-                            // 2 === boolean
-                            rows[c].val = !!rows[c].val;
-                        }
-                        if (options.addId && !rows[c].id && options.id) {
-                            rows[c].id = options.id;
-                        }
-                    }
+                    this.#normalizeRows(rows, options);
                 }
                 callback?.(err, rows);
             });
         });
+    }
+
+    /**
+     * Apply the per-row fix-ups to DB rows in place: numeric ts, debug date, ack coercion,
+     * value rounding, boolean coercion for bool datapoints, and addId. Shared by the buffered
+     * `#getDataFromDB` path and the streamed aggregation path so both behave identically.
+     */
+    #normalizeRows(
+        rows: (IobDataEntryEx & { date?: Date; id?: string })[],
+        options: ioBroker.GetHistoryOptions & { id: string | null; index?: number | null },
+    ): void {
+        for (let c = 0; c < rows.length; c++) {
+            if (typeof rows[c].ts === 'string') {
+                rows[c].ts = parseInt(rows[c].ts as unknown as string, 10);
+            }
+
+            if (this.common?.loglevel === 'debug') {
+                rows[c].date = new Date(rows[c].ts);
+            }
+            if (options.ack) {
+                rows[c].ack = !!rows[c].ack;
+            }
+            if (typeof rows[c].val === 'number' && isFinite(rows[c].val as any) && options.round) {
+                rows[c].val = Math.round((rows[c].val as number) * options.round) / options.round;
+            }
+            if (options.id && this.sqlDPs[options.id] && this.sqlDPs[options.id].type === 2) {
+                // 2 === boolean
+                rows[c].val = !!rows[c].val;
+            }
+            if (options.addId && !rows[c].id && options.id) {
+                rows[c].id = options.id;
+            }
+        }
     }
 
     getDataFromDB(
@@ -3187,61 +3202,42 @@ export class SqlAdapter extends Adapter {
                         msg.callback,
                     );
                 } else {
-                    const origEnd = options.end;
-                    if (includesInFlightData && earliestTs) {
-                        options.end = earliestTs;
+                    // Stream the aggregated PostgreSQL read in batches instead of buffering the whole
+                    // range in RAM. Only safe when there is no cached RAM data to merge in (cached rows
+                    // would interleave by ts and could change the float-sum order), the request has a
+                    // start time (aggregated-with-start query shape), and it is a bucket aggregation
+                    // (not 'none'/'onchange', which pass raw rows through).
+                    //
+                    // 'integralTotal' is deliberately excluded: its finisher folds a single global
+                    // series in insertion order and never re-sorts it, so a pre-start border row that is
+                    // more than one step before start (which aggregation() injects at the END of the
+                    // call that contains it) lands in a different position when the stream is chunked,
+                    // changing the result. Every bucket aggregation (incl. per-bucket 'integral', which
+                    // sorts each bucket) is chunk-invariant; see test/testCommons.js.
+                    const useStreaming =
+                        this.config.dbtype === 'postgresql' &&
+                        this.multiRequests &&
+                        !!options.start &&
+                        options.aggregate !== 'none' &&
+                        options.aggregate !== 'onchange' &&
+                        options.aggregate !== 'integralTotal' &&
+                        cacheData.length === 0;
+                    if (useStreaming) {
+                        this.#getAggregatedDataStreamed(dbNames[type], options, msg, startTime, debugLog, logId);
+                        return;
                     }
                     // if not all data read
-                    this.getDataFromDB(dbNames[type], options, (err, data) => {
-                        if (!err && data) {
-                            options.end = origEnd;
-                            if (options.aggregate === 'none' && options.count && options.returnNewestEntries) {
-                                cacheData = cacheData.reverse();
-                                data = cacheData.concat(data);
-                            } else {
-                                data = data.concat(cacheData);
-                            }
-                            if (debugLog) {
-                                this.log.debug(`${logId} after getDataFromDB: length = ${data.length}`);
-                            }
-                            if (
-                                options.count &&
-                                data.length > options.count &&
-                                options.aggregate === 'none' &&
-                                !options.returnNewestEntries
-                            ) {
-                                if (options.start) {
-                                    for (let i = 0; i < data.length; i++) {
-                                        if (data[i].ts < options.start) {
-                                            data.splice(i, 1);
-                                            i--;
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                }
-                                data.splice(options.count);
-                                if (debugLog) {
-                                    this.log.debug(`${logId} pre-cut data to ${options.count} oldest values`);
-                                }
-                            }
-
-                            data.sort(sortByTs);
-                        }
-                        try {
-                            sendResponse(
-                                this,
-                                msg,
-                                options.id!,
-                                options,
-                                err?.toString() || (data as IobDataEntry[]) || [],
-                                startTime,
-                                debugLog ? logId : undefined,
-                            );
-                        } catch (e) {
-                            sendResponse(this, msg, options.id!, options, e.toString(), startTime);
-                        }
-                    });
+                    this.#getSingleIdBuffered(
+                        dbNames[type],
+                        options,
+                        msg,
+                        startTime,
+                        debugLog,
+                        logId,
+                        cacheData,
+                        includesInFlightData,
+                        earliestTs,
+                    );
                 }
             });
         } else {
@@ -3283,6 +3279,187 @@ export class SqlAdapter extends Adapter {
                 }
             });
         }
+    }
+
+    /**
+     * Classic buffered single-id read + aggregate path, extracted verbatim from getHistorySql so the
+     * streamed path can fall back to the exact same behaviour when streaming is unavailable.
+     */
+    #getSingleIdBuffered(
+        table: TableName,
+        options: ioBroker.GetHistoryOptions & { id: string | null; index: number | null },
+        msg: ioBroker.Message,
+        startTime: number,
+        debugLog: boolean,
+        logId: string,
+        cacheData: (IobDataEntryEx & { date?: Date })[],
+        includesInFlightData: boolean,
+        earliestTs: number | null,
+    ): void {
+        const origEnd = options.end;
+        if (includesInFlightData && earliestTs) {
+            options.end = earliestTs;
+        }
+        this.getDataFromDB(table, options, (err, data) => {
+            if (!err && data) {
+                options.end = origEnd;
+                if (options.aggregate === 'none' && options.count && options.returnNewestEntries) {
+                    cacheData = cacheData.reverse();
+                    data = cacheData.concat(data);
+                } else {
+                    data = data.concat(cacheData);
+                }
+                if (debugLog) {
+                    this.log.debug(`${logId} after getDataFromDB: length = ${data.length}`);
+                }
+                if (
+                    options.count &&
+                    data.length > options.count &&
+                    options.aggregate === 'none' &&
+                    !options.returnNewestEntries
+                ) {
+                    if (options.start) {
+                        for (let i = 0; i < data.length; i++) {
+                            if (data[i].ts < options.start) {
+                                data.splice(i, 1);
+                                i--;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    data.splice(options.count);
+                    if (debugLog) {
+                        this.log.debug(`${logId} pre-cut data to ${options.count} oldest values`);
+                    }
+                }
+
+                data.sort(sortByTs);
+            }
+            try {
+                sendResponse(
+                    this,
+                    msg,
+                    options.id!,
+                    options,
+                    err?.toString() || (data as IobDataEntry[]) || [],
+                    startTime,
+                    debugLog ? logId : undefined,
+                );
+            } catch (e) {
+                sendResponse(this, msg, options.id!, options, e.toString(), startTime);
+            }
+        });
+    }
+
+    /**
+     * Streamed aggregated single-id read: fold DB rows into the aggregator batch-by-batch through
+     * pg-cursor so memory stays flat, instead of buffering the whole range in RAM.
+     *
+     * Byte-identical output to the buffered path: the aggregated-with-start query has all rows in one
+     * global `ORDER BY ts` with at most one out-of-range border row on each side, so feeding the
+     * ts-ordered stream chunk-by-chunk into aggregation() is equivalent to one whole-array call (all
+     * cross-row state lives on `options`).
+     *
+     * We cannot reuse sendResponse() for the finish because it re-runs initAggregate+aggregation on a
+     * whole data array, which would re-aggregate. Instead we replicate only its finishing + envelope:
+     *   - `responseStep` is captured BEFORE initAggregate (mirrors sendResponse's `step = options.step || 0`).
+     *   - the aggregator is initialized lazily on the first streamed chunk, so if streaming turns out to
+     *     be unavailable, `options` stays pristine and the buffered fallback's sendResponse behaves exactly
+     *     as it would have without us ever touching options.
+     *   - the No-Data envelope is keyed on "the DB returned zero rows" (== sendResponse's `!data[0]` check),
+     *     producing `{ result: [], step: null, sessionId }`; otherwise `{ result, step: responseStep, sessionId }`.
+     */
+    #getAggregatedDataStreamed(
+        table: TableName,
+        options: ioBroker.GetHistoryOptions & { id: string | null; index: number | null },
+        msg: ioBroker.Message,
+        startTime: number,
+        debugLog: boolean,
+        logId: string,
+    ): void {
+        // Must be captured before initAggregate mutates options.step (mirrors sendResponse).
+        const responseStep = options.step || 0;
+
+        const query = this.sqlFuncs!.getHistory(this.config.dbname, table, options);
+        this.log.debug(query);
+
+        let log: ((text: string) => void) | undefined;
+        if (debugLog) {
+            log = (text: string): void => this.log.debug(`${logId}: ${text}`);
+        }
+
+        // Initialize the aggregator lazily on the first chunk. onRows() is only ever called when
+        // streaming really happens, so if it does not, options stays untouched for the buffered fallback.
+        let internalOptions: InternalHistoryOptions | undefined;
+        let totalRows = 0;
+        const ensureInit = (): void => {
+            internalOptions ??= initAggregate(options, options.id ?? undefined, undefined, log);
+        };
+
+        this.borrowClientFromPool((err, client) => {
+            if (err || !client) {
+                this.returnClientToPool(client);
+                // mirror sendResponse's string-error envelope
+                sendResponse(this, msg, options.id!, options, (err || new Error('No client')).toString(), startTime);
+                return;
+            }
+
+            client.executeStreamed<IobDataEntryEx & { date?: Date; id?: string }>(
+                query,
+                STREAM_BATCH_SIZE,
+                rows => {
+                    ensureInit();
+                    this.#normalizeRows(rows, options);
+                    totalRows += rows.length;
+                    aggregation(internalOptions!, rows as unknown as IobDataEntry[]);
+                },
+                (streamErr, streamed) => {
+                    this.returnClientToPool(client);
+
+                    if (!streamed) {
+                        // streaming not available (native driver / missing pg-cursor / connect issue):
+                        // options is still pristine (onRows never ran) -> run the buffered path unchanged.
+                        // This branch is only reached with an empty RAM cache (streaming trigger condition).
+                        if (debugLog) {
+                            this.log.debug(`${logId}: streamed read unavailable, using buffered path`);
+                        }
+                        this.#getSingleIdBuffered(table, options, msg, startTime, debugLog, logId, [], false, null);
+                        return;
+                    }
+                    if (streamErr) {
+                        sendResponse(this, msg, options.id!, options, streamErr.toString(), startTime);
+                        return;
+                    }
+                    try {
+                        if (totalRows === 0) {
+                            // No-Data: identical to sendResponse's empty-data envelope
+                            this.log.info('No Data');
+                            this.sendTo(
+                                msg.from,
+                                msg.command,
+                                { result: [], step: null, sessionId: options.sessionId },
+                                msg.callback,
+                            );
+                        } else {
+                            finishAggregation(internalOptions!);
+                            const result = internalOptions!.result;
+                            this.log.debug(
+                                `Send after aggregation (streamed): ${result?.length} of: ${totalRows} in: ${Date.now() - startTime}ms`,
+                            );
+                            this.sendTo(
+                                msg.from,
+                                msg.command,
+                                { result, step: responseStep, sessionId: options.sessionId },
+                                msg.callback,
+                            );
+                        }
+                    } catch (e) {
+                        sendResponse(this, msg, options.id!, options, e.toString(), startTime);
+                    }
+                },
+            );
+        });
     }
 
     update(id: string, state: ioBroker.State, cb?: (err?: Error | null) => void): void {

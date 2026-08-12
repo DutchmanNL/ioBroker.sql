@@ -99,6 +99,24 @@ export default class SQLClient extends EventEmitter {
         });
     }
 
+    executeStreamed<T>(
+        sql: string,
+        batchSize: number,
+        onRows: (rows: Array<T>) => void,
+        callback: (err: Error | null | undefined, streamed: boolean) => void,
+    ): void {
+        if (!this.connection) {
+            return this.connect(err => {
+                if (err) {
+                    callback(err, false);
+                } else {
+                    this.executeStreamed(sql, batchSize, onRows, callback);
+                }
+            });
+        }
+        this.factory.executeStreamed(this.connection, sql, batchSize, onRows, callback);
+    }
+
     async executeAsync<T>(sql: string): Promise<Array<T> | undefined> {
         if (!this.connection) {
             await this.connectAsync();

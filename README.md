@@ -550,6 +550,7 @@ sendTo('sql.0', 'getEnabledDPs', {}, function (result) {
 ### **WORK IN PROGRESS**
 * (@DutchmanNL) Fixed getCounter for PostgreSQL: the query used MySQL-style identifiers and always failed with a syntax error
 * (@DutchmanNL) PostgreSQL: added opt-in setting to relax commit durability (synchronous_commit=off) - strongly reduces disk I/O; a crash of the database server can lose the last moments of stored values, the database cannot be corrupted
+* (@DutchmanNL) PostgreSQL: aggregated getHistory reads stream rows in batches instead of buffering the whole range in RAM
 
 ### 4.0.4 (2026-08-11)
 * (@GermanBluefox) Fixed that nothing was stored for datapoints with an `aliasId`: the adapter subscribed to the alias name instead of the real state ID, so no state change ever arrived

@@ -126,6 +126,13 @@ jobs:
               run: node node_modules/mocha/bin/mocha test/testPostgreSQLSyncCommit.js --exit
               env:
                   SQL_PASS: postgres
+
+            # Separate mocha invocation: this file starts its own js-controller, so it must not share a
+            # mocha process with test/testPostgreSQL.js (one js-controller per mocha process).
+            - name: Run Postgres streamed getHistory test
+              run: node node_modules/mocha/bin/mocha test/testPostgreSQLStreamed.js --exit
+              env:
+                  SQL_PASS: postgres
     #      - name: Run unit tests
     #        run: npm run test:unit
     #      - name: Run integration tests # (linux/osx)

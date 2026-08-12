@@ -92,6 +92,19 @@ class SQLClient extends node_events_1.EventEmitter {
             }
         });
     }
+    executeStreamed(sql, batchSize, onRows, callback) {
+        if (!this.connection) {
+            return this.connect(err => {
+                if (err) {
+                    callback(err, false);
+                }
+                else {
+                    this.executeStreamed(sql, batchSize, onRows, callback);
+                }
+            });
+        }
+        this.factory.executeStreamed(this.connection, sql, batchSize, onRows, callback);
+    }
     async executeAsync(sql) {
         if (!this.connection) {
             await this.connectAsync();
