@@ -253,6 +253,7 @@
     "writeNulls": true,
     "doNotCreateDatabase": false,
     "pgSynchronousCommitOff": false,
+    "nativeAggregation": true,
     "writeInterval": 0,
     "maxLength": 0,
     "blockTime": 0,
