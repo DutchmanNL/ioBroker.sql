@@ -571,12 +571,15 @@ sendTo('sql.0', 'getEnabledDPs', {}, function (result) {
 
 ## Changelog
 ### **WORK IN PROGRESS**
-* (@DutchmanNL) Fixed getCounter for PostgreSQL: the query used MySQL-style identifiers and always failed with a syntax error
-* (@DutchmanNL) PostgreSQL: added opt-in setting to relax commit durability (synchronous_commit=off) - strongly reduces disk I/O; a crash of the database server can lose the last moments of stored values, the database cannot be corrupted
-* (@DutchmanNL) PostgreSQL: aggregated getHistory reads stream rows in batches instead of buffering the whole range in RAM
-* (@DutchmanNL) PostgreSQL: average/min/max/total/count aggregations are computed by the database server (identical results, far less memory and transfer); disable with the "Aggregate in the database" option
-* (@DutchmanNL) PostgreSQL: added opt-in write batching ("Batch write interval"): buffered values are written together in one transaction every X ms instead of one commit per value (0 = previous behavior)
-* (@DutchmanNL) Buffered values are now reliably written on adapter stop, also when "Write NULL values" is disabled
+* (@DutchmanNL) Fixed getCounter for PostgreSQL, SQLite and MS SQL: the queries were invalid on three of the four dialects (only MySQL worked); counter reads are now covered by a test on every dialect
+* (@DutchmanNL) PostgreSQL: with "Do not create database" enabled the adapter (and the connection test) connects directly to the configured database and no longer requires access to the maintenance database "postgres" (#404, #285) - this also enables managed PostgreSQL services like Supabase (#481)
+* (@DutchmanNL) getHistory with average/total (the default aggregate) no longer returns null for boolean datapoints (#360)
+* (@DutchmanNL) info.connection now turns false after repeated connection failures instead of staying true while the database is unreachable (#374)
+* (@DutchmanNL) PostgreSQL: added opt-in setting to relax commit durability (synchronous_commit=off) - strongly reduces disk I/O; a crash of the database server can lose the last moments of stored values, the database cannot be corrupted (#516)
+* (@DutchmanNL) PostgreSQL: aggregated getHistory reads stream rows in batches instead of buffering the whole range in RAM (#516)
+* (@DutchmanNL) PostgreSQL: average/min/max/total/count aggregations are computed by the database server (identical results, far less memory and transfer); disable with the "Aggregate in the database" option (#516)
+* (@DutchmanNL) PostgreSQL: added opt-in write batching ("Batch write interval"): buffered values are written together in one transaction every X ms instead of one commit per value (0 = previous behavior) (#516, answers the write-frequency question in #298)
+* (@DutchmanNL) Buffered values are now reliably written on adapter stop, also when "Write NULL values" is disabled (#298)
 
 ### 4.0.4 (2026-08-11)
 * (@GermanBluefox) Fixed that nothing was stored for datapoints with an `aliasId`: the adapter subscribed to the alias name instead of the real state ID, so no state change ever arrived
