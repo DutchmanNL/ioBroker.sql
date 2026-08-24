@@ -19,9 +19,10 @@ let sendToID = 1;
 
 const adapterShortName = setup.adapterName.substring(setup.adapterName.indexOf('.') + 1);
 
-// Wide enough that a slow CI runner cannot outrun the buffer window: the shutdown-flush test depends
-// on its pre-stop DB check happening BEFORE the timer flush, and CI round trips have been observed to
-// exceed 500 ms. All waits in this file scale off this constant.
+// Wide enough that a slow CI runner comfortably fits a write plus a DB round trip inside one window;
+// CI round trips have been observed to exceed 500 ms. The shutdown-flush test does not rely on this
+// margin alone - it syncs to the flush timer first - but the burst test still reads "inside the
+// window" by wall clock. All waits in this file scale off this constant.
 const WRITE_INTERVAL = 5000;
 const dp1 = 'sql.0.batchTest1';
 const dp2 = 'sql.0.batchTest2';
@@ -64,6 +65,24 @@ async function readValuesFromDb(dpName, ts) {
         return res.rows.map(r => r.val);
     } finally {
         await client.end();
+    }
+}
+
+// Poll the DB until `val` shows up at `ts`. Used to observe a flush actually happening, which is the
+// only way a test can tell where it currently sits inside the adapter's fixed flush cadence.
+async function waitForValueInDb(dpName, ts, val, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        const vals = await readValuesFromDb(dpName, ts);
+        if (vals.includes(val)) {
+            return;
+        }
+        if (Date.now() >= deadline) {
+            throw new Error(
+                `value ${val} never reached the DB within ${timeoutMs} ms - the flush timer does not appear to be running`,
+            );
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
     }
 }
 
@@ -246,13 +265,29 @@ describe(`Test ${__filename}`, function () {
         const shutdownVal = 4242;
 
         const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+        const setState = (id, val, ts) =>
+            new Promise((resolve, reject) => {
+                states.setState(id, { val, ts, ack: true }, err => (err ? reject(err) : resolve()));
+            });
 
-        await new Promise((resolve, reject) => {
-            states.setState(dp1, { val: shutdownVal, ts: shutdownTs, ack: true }, err => (err ? reject(err) : resolve()));
-        });
+        // The flush timer is a setInterval started when the adapter booted, so its ticks fall on a fixed
+        // cadence that has nothing to do with when this test writes. Writing the value blind would leave a
+        // ~100 ms window in which the next tick lands between the write and the pre-stop check, flushing the
+        // value early and failing the precondition below for a reason that says nothing about shutdown.
+        //
+        // So first find out where we are in that cadence: write a sentinel and wait for it to reach the DB.
+        // Its arrival means a tick has just fired, which leaves the real value - written immediately after -
+        // very nearly a full WRITE_INTERVAL before the next one.
+        const sentinelTs = shutdownTs - 1000; // distinct row, same 1h-in-the-future region
+        const sentinelVal = 4241;
+        await setState(dp1, sentinelVal, sentinelTs);
+        await waitForValueInDb(dp1, sentinelTs, sentinelVal, WRITE_INTERVAL * 3);
+        console.log(`PostgreSQL-batching synced to flush timer via sentinel at ts=${sentinelTs}`);
 
-        // Wait only 100 ms - well inside the buffer window - so the value is still only in RAM and has NOT been
-        // written by the timer yet. A clean stop must flush it.
+        await setState(dp1, shutdownVal, shutdownTs);
+
+        // Wait only 100 ms - a whole window away from the next tick after the sync above - so the value is
+        // still only in RAM and has NOT been written by the timer yet. A clean stop must flush it.
         await delay(100);
 
         // Prove the value is NOT in the DB yet (still buffered in RAM at this point).
@@ -260,7 +295,8 @@ describe(`Test ${__filename}`, function () {
         console.log(`PostgreSQL-batching pre-stop DB rows for ts=${shutdownTs}: ${JSON.stringify(before)}`);
         assert.ok(
             !before.includes(shutdownVal),
-            `value ${shutdownVal} was already in the DB before stop - not a valid shutdown-flush test`,
+            `value ${shutdownVal} was already in the DB before stop, despite being written right after a ` +
+                `flush - it should have stayed buffered for a full ${WRITE_INTERVAL} ms window`,
         );
 
         const reply = await new Promise(resolve => sendTo('sql.0', 'stopInstance', {}, resolve));
