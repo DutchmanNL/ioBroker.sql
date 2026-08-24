@@ -15,7 +15,10 @@ let sendToID = 1;
 
 const adapterShortName = setup.adapterName.substring(setup.adapterName.indexOf('.') + 1);
 
-const testDp = 'system.adapter.sql.0.memHeapTotal';
+// Dedicated synthetic datapoint: in CI all Postgres test steps share one database, so a shared live
+// state (like memHeapTotal, which earlier steps enable and write to) would leak old rows and
+// writeNulls markers into this test's time window. A datapoint only this file uses is deterministic.
+const testDp = 'sql.0.streamTestValue';
 
 function checkConnectionOfAdapter(cb, counter) {
     counter ||= 0;
@@ -103,27 +106,29 @@ describe(`Test ${__filename}`, function () {
     it(`Test ${__filename}: Check if adapter started and enable history`, function (done) {
         this.timeout(60000);
         checkConnectionOfAdapter(function () {
-            sendTo(
-                'sql.0',
-                'enableHistory',
-                {
-                    id: testDp,
-                    options: {
-                        changesOnly: false,
-                        debounce: 0,
-                        retention: 31536000,
-                        maxLength: 0,
-                        storageType: 'Number',
+            objects.setObject(testDp, { common: { type: 'number', role: 'state', custom: {} }, type: 'state' }, () =>
+                sendTo(
+                    'sql.0',
+                    'enableHistory',
+                    {
+                        id: testDp,
+                        options: {
+                            changesOnly: false,
+                            debounce: 0,
+                            retention: 31536000,
+                            maxLength: 0,
+                            storageType: 'Number',
+                        },
                     },
-                },
-                function (result) {
-                    assert.strictEqual(result.error, undefined);
-                    assert.strictEqual(result.success, true);
-                    // wait till adapter receives the new settings
-                    setTimeout(function () {
-                        done();
-                    }, 10000);
-                },
+                    function (result) {
+                        assert.strictEqual(result.error, undefined);
+                        assert.strictEqual(result.success, true);
+                        // wait till adapter receives the new settings
+                        setTimeout(function () {
+                            done();
+                        }, 10000);
+                    },
+                ),
             );
         });
     });

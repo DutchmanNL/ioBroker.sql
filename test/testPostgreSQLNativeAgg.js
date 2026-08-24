@@ -21,8 +21,10 @@ let sendToID = 1;
 const adapterShortName = setup.adapterName.substring(setup.adapterName.indexOf('.') + 1);
 
 // Two distinct numeric datapoints so the null-in-range case cannot pollute the null-free cases.
-const testDp = 'system.adapter.sql.0.memRss';
-const nullDp = 'system.adapter.sql.0.memHeapUsed';
+// Dedicated synthetic datapoints: in CI all Postgres test steps share one database, so shared live
+// system states would leak rows/markers from other steps into these tests' time windows.
+const testDp = 'sql.0.nativeAggTestValue';
+const nullDp = 'sql.0.nativeAggNullValue';
 
 function checkConnectionOfAdapter(cb, counter) {
     counter ||= 0;
@@ -178,8 +180,11 @@ describe(`Test ${__filename}`, function () {
 
     it(`Test ${__filename}: Check if adapter started, enable history and store values`, function (done) {
         this.timeout(90000);
-        checkConnectionOfAdapter(function (err) {
+        checkConnectionOfAdapter(async function (err) {
             assert.ok(!err, err);
+            const stateObj = { common: { type: 'number', role: 'state', custom: {} }, type: 'state' };
+            await objects.setObjectAsync(testDp, stateObj);
+            await objects.setObjectAsync(nullDp, stateObj);
             sendTo(
                 'sql.0',
                 'enableHistory',
