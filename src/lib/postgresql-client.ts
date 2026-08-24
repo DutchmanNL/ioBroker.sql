@@ -110,7 +110,10 @@ class PostgreSQLConnectionFactory extends ConnectionFactory {
                     return;
                 }
                 if (!rows.length) {
-                    cursor.close((closeErr: Error) => finish(closeErr ?? null));
+                    // All rows were delivered and aggregated - a failure while closing the cursor must
+                    // not fail the (already complete) result. If the connection broke, the pool's
+                    // validation/eviction handles the returned client.
+                    cursor.close(() => finish(null));
                     return;
                 }
                 onRows(rows);

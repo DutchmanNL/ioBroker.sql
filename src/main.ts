@@ -319,6 +319,12 @@ export class SqlAdapter extends Adapter {
     private sqlFuncs: SQLFunc | null = null;
     /** true after a batched write failed once; a second consecutive failure drops the rows instead of re-queueing */
     private batchWriteFailed = false;
+    /** true while a batched write is on the wire; the flush timer skips its tick instead of overlapping it */
+    private batchFlushActive = false;
+    /** learned on the first streamed-read attempt (pg-native / missing pg-cursor); skips the futile borrow afterwards */
+    private streamingUnavailable = false;
+    /** the recurring nulls-in-range aggregation fallback is reported at info level only once per run */
+    private nullsFallbackReported = false;
 
     public constructor(options: Partial<AdapterOptions> = {}) {
         super({
@@ -845,6 +851,8 @@ export class SqlAdapter extends Adapter {
             }
 
             try {
+                // a fresh pool may have different streaming capabilities (driver/module changes)
+                this.streamingUnavailable = false;
                 if (this.config.dbtype === 'mssql' && msSQLOptions) {
                     this.clientPool = new MSSQLClientPool(poolOptions, msSQLOptions);
                 } else if (this.config.dbtype === 'mysql' && mySQLOptions) {
@@ -1364,39 +1372,41 @@ export class SqlAdapter extends Adapter {
         }
         this.finished = [callback];
 
-        const ids: string[] = [];
-        for (const id in this.sqlDPs) {
-            if (!Object.prototype.hasOwnProperty.call(this.sqlDPs, id)) {
-                continue;
+        // A batch flush may be running right now (the bufferChecker timer was just cleared, but a tick
+        // that already started still holds a borrowed client and every datapoint's rows in inFlight).
+        // Closing the pool under it would kill the write, and a failing batch re-queues its rows into
+        // lists AFTER the per-datapoint flush below already ran - silently losing the whole window.
+        // Wait (bounded) for it to complete before flushing: on success the rows are persisted; on
+        // failure they are re-queued into the lists, which the flush below then writes.
+        const startFinish = (attempt: number): void => {
+            if (this.batchFlushActive && attempt < 50) {
+                setTimeout(startFinish, 100, attempt + 1);
+                return;
             }
-            ids.push(id);
-        }
-        const dpcount = ids.length;
 
-        if (!dpcount) {
-            // Nothing to flush: close the pool and fire the finished callbacks exactly once.
-            allFinished();
-            return;
-        }
+            const ids = Object.keys(this.sqlDPs);
+            const dpcount = ids.length;
 
-        // Count completions so allFinished() (which closes the pool) runs EXACTLY ONCE, after every
-        // datapoint has fully flushed. Previously a single shared counter mutated across staggered
-        // setTimeouts could reach zero while later datapoints were still scheduled, closing the pool early.
-        let remaining = dpcount;
-        const oneDone = (): void => {
-            if (!--remaining) {
+            if (!dpcount) {
+                // Nothing to flush: close the pool and fire the finished callbacks exactly once.
                 allFinished();
+                return;
             }
-        };
 
-        // Keep the 50-datapoints-per-1000ms stagger to avoid a connection stampede on shutdown.
-        let dpcounter = 0;
-        let delay = 0;
-        for (const id of ids) {
-            dpcounter++;
-            delay += dpcounter % 50 === 0 ? 1000 : 0;
-            setTimeout(finishId, delay, id, oneDone);
-        }
+            // Count completions so allFinished() (which closes the pool) runs EXACTLY ONCE, after every
+            // datapoint has fully flushed. Previously a single shared counter mutated across staggered
+            // setTimeouts could reach zero while later datapoints were still scheduled, closing the pool early.
+            let remaining = dpcount;
+            const oneDone = (): void => {
+                if (!--remaining) {
+                    allFinished();
+                }
+            };
+
+            // Keep the 50-datapoints-per-1000ms stagger to avoid a connection stampede on shutdown.
+            ids.forEach((id, i) => setTimeout(finishId, Math.floor((i + 1) / 50) * 1000, id, oneDone));
+        };
+        startFinish(0);
     }
 
     processMessage(msg: ioBroker.Message): void {
@@ -2447,7 +2457,16 @@ export class SqlAdapter extends Adapter {
         // Time-window write batching: a global flush (no onlyId) writes ALL datapoints together in one
         // transaction on one connection. Per-id flushes and the SQLite/tasks path (multiRequests === false)
         // keep the original per-datapoint behaviour untouched.
-        if (onlyId === undefined && this.config.writeInterval > 0 && this.multiRequests) {
+        // PostgreSQL only: the batch retry relies on ON CONFLICT DO NOTHING for idempotency and on
+        // BEGIN/COMMIT for atomicity, neither of which the other dialects provide (MSSQL has no unique
+        // index at all, ts_counter none anywhere) - a stale writeInterval after a dbtype switch must not
+        // silently enable non-atomic batching there.
+        if (
+            onlyId === undefined &&
+            this.config.writeInterval > 0 &&
+            this.multiRequests &&
+            this.config.dbtype === 'postgresql'
+        ) {
             return this.storeCachedBatch(cb);
         }
 
@@ -2497,15 +2516,23 @@ export class SqlAdapter extends Adapter {
      * commits (and fsyncs) once.
      */
     storeCachedBatch(cb?: ((err?: Error | null) => void) | null): void {
+        // Re-entrancy guard: a flush that outlives the writeInterval must not overlap the next tick's
+        // batch - two concurrent BEGIN/COMMIT batches would defeat the one-transaction-per-window design
+        // and race the batchWriteFailed bookkeeping. The skipped tick's rows simply ride the next one.
+        if (this.batchFlushActive) {
+            cb?.();
+            return;
+        }
+
         const entries: { id: string; inFlightId: string; rowCount: number }[] = [];
-        let statements: string[] = [];
+        const statements: string[] = [];
 
         for (const id in this.sqlDPs) {
             if (!Object.prototype.hasOwnProperty.call(this.sqlDPs, id)) {
                 continue;
             }
-            const _settings = this.sqlDPs[id].config || {};
-            if (_settings && this.sqlDPs[id]?.list?.length) {
+            if (this.sqlDPs[id].list?.length) {
+                const _settings = this.sqlDPs[id].config || {};
                 if (_settings.enableDebugLogs) {
                     this.log.debug(`batching ${this.sqlDPs[id].list.length} entries from ${id} to DB`);
                 }
@@ -2514,7 +2541,17 @@ export class SqlAdapter extends Adapter {
                 this.sqlDPs[id].inFlight ||= {};
                 this.sqlDPs[id].inFlight[inFlightId] = rows;
                 this.sqlDPs[id].list = [];
-                statements = statements.concat(this.sqlFuncs!.insert(this.config.dbname, this.sqlDPs[id].index, rows));
+                // insert() rewrites value.state.val in place (null -> 'NULL', strings -> quoted). Hand it
+                // COPIES so the buffered originals stay pristine: a re-queued retry would otherwise store a
+                // null string value as the literal text 'NULL', and getHistory's RAM-cache merge would
+                // serve the mutated values for the whole retry window.
+                statements.push(
+                    ...this.sqlFuncs!.insert(
+                        this.config.dbname,
+                        this.sqlDPs[id].index,
+                        rows.map(row => ({ ...row, state: { ...row.state } })),
+                    ),
+                );
                 entries.push({ id, inFlightId, rowCount: rows.length });
             }
         }
@@ -2524,13 +2561,11 @@ export class SqlAdapter extends Adapter {
             return;
         }
 
-        let transactional = false;
-        if (this.config.dbtype === 'postgresql' && statements.length > 1) {
-            statements = ['BEGIN;', ...statements, 'COMMIT;'];
-            transactional = true;
-        }
-
-        this._insertValuesBatchIntoDB(statements, entries, transactional, cb || undefined);
+        this.batchFlushActive = true;
+        this._insertValuesBatchIntoDB(statements, entries, err => {
+            this.batchFlushActive = false;
+            cb?.(err);
+        });
     }
 
     /**
@@ -2543,11 +2578,14 @@ export class SqlAdapter extends Adapter {
      * rows can be re-queued (first failure) or dropped (second consecutive failure).
      */
     _insertValuesBatchIntoDB(
-        queries: string[],
+        rawQueries: string[],
         entries: { id: string; inFlightId: string; rowCount: number }[],
-        transactional: boolean,
         cb?: (err?: Error | null) => void,
     ): void {
+        // The transaction wrap and the ROLLBACK handling belong together in one place: a caller must not
+        // be able to pass a BEGIN-prefixed batch without the matching rollback-on-error semantics.
+        const transactional = this.config.dbtype === 'postgresql' && rawQueries.length > 1;
+        const queries = transactional ? ['BEGIN;', ...rawQueries, 'COMMIT;'] : rawQueries;
         const totalRows = entries.reduce((sum, entry) => sum + entry.rowCount, 0);
 
         const requeueOrDrop = (err: Error): void => {
@@ -2566,7 +2604,10 @@ export class SqlAdapter extends Adapter {
                 }
                 this.log.warn(`Cannot write batch of ${totalRows} values, re-queued for next flush: ${err}`);
             } else {
-                // Second consecutive failure: drop the rows without re-queue to avoid unbounded RAM growth.
+                // Failure of the retried batch: drop the rows without re-queue to avoid unbounded RAM
+                // growth, and RESET the flag so the NEXT batch (fresh rows) gets its own re-queue retry -
+                // otherwise every batch during an extended outage would be dropped on its first failure.
+                this.batchWriteFailed = false;
                 for (const entry of entries) {
                     const dp = this.sqlDPs[entry.id];
                     if (dp?.inFlight?.[entry.inFlightId]) {
@@ -3052,12 +3093,14 @@ export class SqlAdapter extends Adapter {
         rows: (IobDataEntryEx & { date?: Date; id?: string })[],
         options: ioBroker.GetHistoryOptions & { id: string | null; index?: number | null },
     ): void {
+        // hoisted: this runs per 2000-row chunk on the streamed path over potentially millions of rows
+        const isDebug = this.common?.loglevel === 'debug';
         for (let c = 0; c < rows.length; c++) {
             if (typeof rows[c].ts === 'string') {
                 rows[c].ts = parseInt(rows[c].ts as unknown as string, 10);
             }
 
-            if (this.common?.loglevel === 'debug') {
+            if (isDebug) {
                 rows[c].date = new Date(rows[c].ts);
             }
             if (options.ack) {
@@ -3415,6 +3458,7 @@ export class SqlAdapter extends Adapter {
                     // sorts each bucket) is chunk-invariant; see test/testCommons.js.
                     const useStreaming =
                         this.config.dbtype === 'postgresql' &&
+                        !this.streamingUnavailable && // learned once: pg-native / pg-cursor missing
                         this.multiRequests &&
                         !!options.start &&
                         options.aggregate !== 'none' &&
@@ -3569,6 +3613,31 @@ export class SqlAdapter extends Adapter {
      *   - the No-Data envelope is keyed on "the DB returned zero rows" (== sendResponse's `!data[0]` check),
      *     producing `{ result: [], step: null, sessionId }`; otherwise `{ result, step: responseStep, sessionId }`.
      */
+    /**
+     * Send an aggregated getHistory reply with the exact envelope sendResponse produces: `null` result
+     * means No-Data (`{ result: [], step: null, sessionId }`), otherwise `{ result, step, sessionId }`.
+     * Single owner for the envelope so the streamed and native-aggregation paths cannot drift apart
+     * from each other (or from sendResponse) when the format changes.
+     */
+    #sendAggEnvelope(
+        msg: ioBroker.Message,
+        options: ioBroker.GetHistoryOptions,
+        responseStep: number,
+        result: IobDataEntry[] | null,
+    ): void {
+        if (!result) {
+            this.log.info('No Data');
+            this.sendTo(msg.from, msg.command, { result: [], step: null, sessionId: options.sessionId }, msg.callback);
+        } else {
+            this.sendTo(
+                msg.from,
+                msg.command,
+                { result, step: responseStep, sessionId: options.sessionId },
+                msg.callback,
+            );
+        }
+    }
+
     #getAggregatedDataStreamed(
         table: TableName,
         options: ioBroker.GetHistoryOptions & { id: string | null; index: number | null },
@@ -3592,6 +3661,11 @@ export class SqlAdapter extends Adapter {
         // streaming really happens, so if it does not, options stays untouched for the buffered fallback.
         let internalOptions: InternalHistoryOptions | undefined;
         let totalRows = 0;
+        // An exception inside onRows (initAggregate can throw RangeError on absurd count/step inputs)
+        // must NOT escape into pg-cursor's read callback: it would be an uncaught exception AND the
+        // borrowed client would never return to the pool. Catch it, drain the remaining chunks, and
+        // answer with the same error envelope the buffered path produces for the same request.
+        let aggError: Error | null = null;
         const ensureInit = (): void => {
             internalOptions ??= initAggregate(options, options.id ?? undefined, undefined, log);
         };
@@ -3608,50 +3682,50 @@ export class SqlAdapter extends Adapter {
                 query,
                 STREAM_BATCH_SIZE,
                 rows => {
-                    ensureInit();
-                    this.#normalizeRows(rows, options);
-                    totalRows += rows.length;
-                    aggregation(internalOptions!, rows as unknown as IobDataEntry[]);
+                    if (aggError) {
+                        return; // already failed - ignore the remaining chunks
+                    }
+                    try {
+                        ensureInit();
+                        this.#normalizeRows(rows, options);
+                        totalRows += rows.length;
+                        aggregation(internalOptions!, rows as unknown as IobDataEntry[]);
+                    } catch (e) {
+                        aggError = e instanceof Error ? e : new Error(String(e));
+                    }
                 },
                 (streamErr, streamed) => {
                     this.returnClientToPool(client);
 
                     if (!streamed) {
-                        // streaming not available (native driver / missing pg-cursor / connect issue):
+                        // Streaming not available (native driver / missing pg-cursor / connect issue):
                         // options is still pristine (onRows never ran) -> run the buffered path unchanged.
                         // This branch is only reached with an empty RAM cache (streaming trigger condition).
-                        if (debugLog) {
+                        // A real error must not be reduced to a debug line, and the discovery is remembered
+                        // so later reads skip the borrow/fail/re-borrow detour entirely.
+                        this.streamingUnavailable = true;
+                        if (streamErr) {
+                            this.log.warn(`${logId}: streamed read failed (${streamErr}), using buffered path`);
+                        } else if (debugLog) {
                             this.log.debug(`${logId}: streamed read unavailable, using buffered path`);
                         }
                         this.#getSingleIdBuffered(table, options, msg, startTime, debugLog, logId, [], false, null);
                         return;
                     }
-                    if (streamErr) {
-                        sendResponse(this, msg, options.id!, options, streamErr.toString(), startTime);
+                    if (streamErr || aggError) {
+                        sendResponse(this, msg, options.id!, options, (streamErr || aggError)!.toString(), startTime);
                         return;
                     }
                     try {
                         if (totalRows === 0) {
-                            // No-Data: identical to sendResponse's empty-data envelope
-                            this.log.info('No Data');
-                            this.sendTo(
-                                msg.from,
-                                msg.command,
-                                { result: [], step: null, sessionId: options.sessionId },
-                                msg.callback,
-                            );
+                            this.#sendAggEnvelope(msg, options, responseStep, null);
                         } else {
                             finishAggregation(internalOptions!);
                             const result = internalOptions!.result;
                             this.log.debug(
                                 `Send after aggregation (streamed): ${result?.length} of: ${totalRows} in: ${Date.now() - startTime}ms`,
                             );
-                            this.sendTo(
-                                msg.from,
-                                msg.command,
-                                { result, step: responseStep, sessionId: options.sessionId },
-                                msg.callback,
-                            );
+                            this.#sendAggEnvelope(msg, options, responseStep, result || null);
                         }
                     } catch (e) {
                         sendResponse(this, msg, options.id!, options, e.toString(), startTime);
@@ -3734,27 +3808,49 @@ export class SqlAdapter extends Adapter {
 
         // Finalize options.step / options.start / options.maxIndex / processing slots. The SQL is
         // built AFTER this so it uses the SAME (possibly clamped) step the aggregator uses.
-        const internalOptions: InternalHistoryOptions = initAggregate(options, options.id ?? undefined, undefined, log);
+        // initAggregate can throw (RangeError on absurd count/step inputs); the buffered path answers
+        // such requests with an error envelope (its sendResponse call is wrapped) - match that instead
+        // of letting the exception escape into the message handler and crash the adapter.
+        let internalOptions: InternalHistoryOptions;
+        let sql: string;
+        try {
+            internalOptions = initAggregate(options, options.id ?? undefined, undefined, log);
+            sql = this.sqlFuncs!.getHistoryAggregate!(this.config.dbname, table, {
+                ...options,
+                index: options.index as number,
+                start: options.start as number,
+                end: options.end as number,
+            });
+        } catch (e) {
+            sendResponse(this, msg, options.id!, options, e.toString(), startTime);
+            return;
+        }
 
         const aggType = options.aggregate;
-
-        const sql = this.sqlFuncs!.getHistoryAggregate!(this.config.dbname, table, {
-            ...options,
-            index: options.index as number,
-            start: options.start as number,
-            end: options.end as number,
-        });
         this.log.debug(sql);
 
-        // One-shot warn on fallback per run.
         const fallbackToNode = (reason: string): void => {
             if (debugLog) {
                 this.log.debug(`${logId}: native aggregation fallback (${reason}), using buffered Node path`);
             }
-            // Restore the pre-initAggregate step so the Node path's sendResponse reports the same
-            // response step it would have without us (initAggregate re-runs there and replaces the
-            // leftover processing arrays anyway; only step is read before that re-init).
+            // Restore the pre-initAggregate step so the fallback path's response reports the same
+            // step it would have without us (initAggregate re-runs there and replaces the leftover
+            // processing arrays anyway; only step is read before that re-init).
             options.step = origStep;
+            if (reason === 'nulls in range' && !this.streamingUnavailable) {
+                // Nulls only reroute the WHERE aggregation happens, not the range size: use the streamed
+                // Node path so a multi-million-row window is not materialized in RAM just because it
+                // spans one writeNulls marker. Its preconditions all hold here by construction (postgresql,
+                // multiRequests, start set, supported bucket aggregate, empty RAM cache).
+                if (!this.nullsFallbackReported) {
+                    this.nullsFallbackReported = true;
+                    this.log.info(
+                        `${logId}: range contains null markers - aggregating in the adapter instead of the database (reported once; enable debug log to see each occurrence)`,
+                    );
+                }
+                this.#getAggregatedDataStreamed(table, options, msg, startTime, debugLog, logId);
+                return;
+            }
             // Same args PR-B uses for its fallback (empty cache, no in-flight).
             this.#getSingleIdBuffered(table, options, msg, startTime, debugLog, logId, [], false, null);
         };
@@ -3802,13 +3898,7 @@ export class SqlAdapter extends Adapter {
 
                     // No data at all (no in-range buckets, no border rows) == sendResponse's !data[0].
                     if (!bucketRows.length && !borderRaw.length) {
-                        this.log.info('No Data');
-                        this.sendTo(
-                            msg.from,
-                            msg.command,
-                            { result: [], step: null, sessionId: options.sessionId },
-                            msg.callback,
-                        );
+                        this.#sendAggEnvelope(msg, options, responseStep, null);
                         return;
                     }
 
@@ -3851,9 +3941,6 @@ export class SqlAdapter extends Adapter {
                             // finisher emits averageCount; count(*) counts ALL rows.
                             internalOptions.averageCount![idx] = cnt;
                         }
-
-                        // Cosmetic parity with aggregation()'s counter (not read by any finisher).
-                        internalOptions.overallLength = (internalOptions.overallLength || 0) + cnt;
                     }
 
                     // Feed the two raw border rows through the REAL aggregation() so border
@@ -3872,12 +3959,7 @@ export class SqlAdapter extends Adapter {
                     this.log.debug(
                         `Send after aggregation (native SQL): ${result?.length} of ${bucketRows.length} buckets in: ${Date.now() - startTime}ms`,
                     );
-                    this.sendTo(
-                        msg.from,
-                        msg.command,
-                        { result, step: responseStep, sessionId: options.sessionId },
-                        msg.callback,
-                    );
+                    this.#sendAggEnvelope(msg, options, responseStep, result || null);
                 } catch (e) {
                     this.log.warn(`${logId}: native aggregation post-processing failed, using Node path: ${e}`);
                     fallbackToNode('exception');
@@ -4682,6 +4764,10 @@ export class SqlAdapter extends Adapter {
         config.nativeAggregation = config.nativeAggregation !== false;
 
         config.writeInterval = parseInt(config.writeInterval as string, 10) || 0;
+        if (config.writeInterval > 0 && config.writeInterval < 100) {
+            // a sub-100ms interval is all timer churn and no batching benefit
+            config.writeInterval = 100;
+        }
 
         config.retention = parseInt(config.retention as string, 10) || 0;
         if (config.retention === -1) {

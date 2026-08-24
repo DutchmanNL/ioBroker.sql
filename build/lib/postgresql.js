@@ -122,12 +122,15 @@ function getCounterDiff(_dbName, options) {
     const subQueryLast = `SELECT ts, val FROM ts_number  WHERE id=${options.index} AND ts>= ${options.end} ORDER BY ts ASC  LIMIT 1`;
     // get values from counters where counter changed from up to down (e.g. counter changed)
     const subQueryCounterChanges = `SELECT ts, val FROM ts_counter WHERE id=${options.index} AND ts>${options.start} AND ts<${options.end} AND val IS NOT NULL ORDER BY ts ASC`;
+    // The outer ORDER BY is required: sendResponseCounter consumes the rows positionally, and
+    // PostgreSQL does not guarantee that a DISTINCT preserves the inner subquery's order (a
+    // HashAggregate plan returns rows in hash order).
     return (`SELECT DISTINCT(a.ts), a.val from ((${subQueryFirst})\n` +
         `UNION ALL \n(${subQueryStart})\n` +
         `UNION ALL \n(${subQueryEnd})\n` +
         `UNION ALL \n(${subQueryLast})\n` +
         `UNION ALL \n(${subQueryCounterChanges})\n` +
-        `ORDER BY ts) a;`);
+        `ORDER BY ts) a ORDER BY a.ts;`);
 }
 function getHistory(_dbName, table, options) {
     let query = `SELECT ts, val${options.index === null ? `, ${table}.id as id` : ''}${options.ack ? ', ack' : ''}${options.from ? ', sources.name as from' : ''}${options.q ? ', q' : ''} FROM ${table}`;

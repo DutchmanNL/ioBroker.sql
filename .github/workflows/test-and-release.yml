@@ -123,31 +123,16 @@ jobs:
               env:
                   SQL_PASS: postgres
 
-            # Separate mocha invocation: this file starts its own js-controller, so it must not share a
-            # mocha process with test/testPostgreSQL.js (one js-controller per mocha process).
-            - name: Run Postgres synchronous_commit test
-              run: node node_modules/mocha/bin/mocha test/testPostgreSQLSyncCommit.js --exit
-              env:
-                  SQL_PASS: postgres
-
-            # Separate mocha invocation: this file starts its own js-controller, so it must not share a
-            # mocha process with test/testPostgreSQL.js (one js-controller per mocha process).
-            - name: Run Postgres streamed getHistory test
-              run: node node_modules/mocha/bin/mocha test/testPostgreSQLStreamed.js --exit
-              env:
-                  SQL_PASS: postgres
-
-            # Separate mocha invocation: this file starts its own js-controller, so it must not share a
-            # mocha process with test/testPostgreSQL.js (one js-controller per mocha process).
-            - name: Run Postgres write batching test
-              run: node node_modules/mocha/bin/mocha test/testPostgreSQLBatching.js --exit
-              env:
-                  SQL_PASS: postgres
-
-            # Separate mocha invocation: this file starts its own js-controller, so it must not share a
-            # mocha process with test/testPostgreSQL.js (one js-controller per mocha process).
-            - name: Run Postgres native aggregation test
-              run: node node_modules/mocha/bin/mocha test/testPostgreSQLNativeAgg.js --exit
+            # Each standalone file starts its own js-controller, so every file needs its own mocha
+            # process (never glob them into one invocation). The loop auto-covers any future
+            # test/testPostgreSQL<Variant>.js file - a new file cannot silently miss CI.
+            - name: Run standalone Postgres tests
+              run: |
+                  for f in test/testPostgreSQL*.js; do
+                      [ "$f" = "test/testPostgreSQL.js" ] && continue
+                      echo "=== $f ==="
+                      node node_modules/mocha/bin/mocha "$f" --exit || exit 1
+                  done
               env:
                   SQL_PASS: postgres
     #      - name: Run unit tests

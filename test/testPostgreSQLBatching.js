@@ -9,8 +9,8 @@ const setup = require('./lib/setup');
 // It runs its OWN js-controller, so it MUST live in its own file and get its own mocha invocation
 // (never globbed together with test/testPostgreSQL.js - one js-controller per mocha process).
 //
-// The adapter is configured with writeInterval = 500 ms: state changes are buffered in RAM and written
-// together in one transaction every 500 ms instead of one commit per value.
+// The adapter is configured with writeInterval = WRITE_INTERVAL ms: state changes are buffered in RAM
+// and written together in one transaction every window instead of one commit per value.
 
 let objects = null;
 let states = null;
@@ -19,7 +19,10 @@ let sendToID = 1;
 
 const adapterShortName = setup.adapterName.substring(setup.adapterName.indexOf('.') + 1);
 
-const WRITE_INTERVAL = 500;
+// Wide enough that a slow CI runner cannot outrun the buffer window: the shutdown-flush test depends
+// on its pre-stop DB check happening BEFORE the timer flush, and CI round trips have been observed to
+// exceed 500 ms. All waits in this file scale off this constant.
+const WRITE_INTERVAL = 5000;
 const dp1 = 'sql.0.batchTest1';
 const dp2 = 'sql.0.batchTest2';
 
@@ -100,7 +103,7 @@ describe(`Test ${__filename}`, function () {
             config.native.dbtype = 'postgresql';
             config.native.user = process.env.SQL_USER || 'postgres';
             config.native.password = process.env.SQL_PASS || '';
-            // The feature under test: buffer values and flush them together every 500 ms.
+            // The feature under test: buffer values and flush them together once per window.
             config.native.writeInterval = WRITE_INTERVAL;
 
             await setup.setAdapterConfig(config.common, config.native);
@@ -167,7 +170,7 @@ describe(`Test ${__filename}`, function () {
         this.timeout(30000);
 
         const testStart = Date.now();
-        // Distinct values on two datapoints, written in a quick burst well inside one 500 ms window.
+        // Distinct values on two datapoints, written in a quick burst well inside one buffer window.
         const vals1 = [11, 12, 13];
         const vals2 = [21, 22, 23];
 
@@ -248,7 +251,7 @@ describe(`Test ${__filename}`, function () {
             states.setState(dp1, { val: shutdownVal, ts: shutdownTs, ack: true }, err => (err ? reject(err) : resolve()));
         });
 
-        // Wait only 100 ms - inside the 500 ms window - so the value is still only in RAM and has NOT been
+        // Wait only 100 ms - well inside the buffer window - so the value is still only in RAM and has NOT been
         // written by the timer yet. A clean stop must flush it.
         await delay(100);
 
