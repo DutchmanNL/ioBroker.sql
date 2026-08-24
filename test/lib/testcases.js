@@ -1555,8 +1555,12 @@ function register(it, sendTo, adapterShortName, writeNulls, assumeExistingData, 
     if (instanceName !== 'influxdb.0') {
         it(`Test ${adapterShortName}: getCounter returns the summed progression incl. a counter reset`, function (done) {
             this.timeout(30000);
-            const counterId = `${instanceName}.testCounter`;
             const base = Date.now();
+            // Run-unique datapoint NAME, not just a unique time window: getCounterDiff's border
+            // subqueries select the LAST row before / FIRST row after the window regardless of age, so
+            // rows left by a previous run against the same database (e.g. its writeNulls stop marker)
+            // would be border-interpolated into the result and shift the expected total by a fraction.
+            const counterId = `${instanceName}.testCounter${base}`;
 
             objects.setObject(
                 counterId,
@@ -1610,6 +1614,93 @@ function register(it, sendTo, adapterShortName, writeNulls, assumeExistingData, 
                                                 },
                                             );
                                         });
+                                    });
+                                });
+                            }, 3000);
+                        },
+                    );
+                },
+            );
+        });
+    }
+    // Boolean datapoints aggregated with the DEFAULT aggregate (average) used to return val=null for
+    // every bucket: parseFloat(true) is NaN, which poisoned the accumulator and serialized as null
+    // (#360). Registered for the SQL dialects; influxdb aggregates server-side.
+    if (instanceName !== 'influxdb.0') {
+        it(`Test ${adapterShortName}: getHistory average on a boolean datapoint returns numbers`, function (done) {
+            this.timeout(30000);
+            const base = Date.now();
+            // Run-unique name so reruns against an existing database never inherit border rows.
+            const boolId = `${instanceName}.testBoolValue${base}`;
+
+            objects.setObject(
+                boolId,
+                { common: { type: 'boolean', role: 'state', custom: {} }, type: 'state' },
+                function () {
+                    sendTo(
+                        instanceName,
+                        'enableHistory',
+                        {
+                            id: boolId,
+                            options: {
+                                changesOnly: false,
+                                debounce: 0,
+                                retention: 31536000,
+                                storageType: 'Boolean',
+                            },
+                        },
+                        function (result) {
+                            assert.strictEqual(result.error, undefined);
+                            assert.strictEqual(result.success, true);
+                            setTimeout(function () {
+                                states.setState(boolId, { val: true, ts: base + 1000, ack: true }, function () {
+                                    states.setState(boolId, { val: false, ts: base + 2000, ack: true }, function () {
+                                        states.setState(
+                                            boolId,
+                                            { val: true, ts: base + 3000, ack: true },
+                                            function () {
+                                                setTimeout(function () {
+                                                    sendTo(
+                                                        instanceName,
+                                                        'getHistory',
+                                                        {
+                                                            id: boolId,
+                                                            options: {
+                                                                start: base,
+                                                                end: base + 4000,
+                                                                count: 2,
+                                                                aggregate: 'average',
+                                                                ignoreNull: false,
+                                                            },
+                                                        },
+                                                        function (result2) {
+                                                            console.log(
+                                                                `boolean average result: ${JSON.stringify(result2.result)}`,
+                                                            );
+                                                            assert.ok(!result2.error, `error: ${result2.error}`);
+                                                            const numeric = result2.result.filter(
+                                                                e => e.val !== null,
+                                                            );
+                                                            // Before the fix every bucket was null (NaN on
+                                                            // the wire). Type-based on purpose: the exact
+                                                            // averages depend on bucket borders.
+                                                            assert.ok(
+                                                                numeric.length > 0,
+                                                                'no numeric values returned for boolean average',
+                                                            );
+                                                            for (const e of numeric) {
+                                                                assert.strictEqual(typeof e.val, 'number');
+                                                                assert.ok(
+                                                                    Number.isFinite(e.val),
+                                                                    `non-finite val: ${e.val}`,
+                                                                );
+                                                            }
+                                                            done();
+                                                        },
+                                                    );
+                                                }, 3000);
+                                            },
+                                        );
                                     });
                                 });
                             }, 3000);

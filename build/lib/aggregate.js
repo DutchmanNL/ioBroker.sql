@@ -270,6 +270,11 @@ function aggregationLogic(data, index, options) {
             options.processing[index].val.ts = Math.round(options.start + (index - 1 + 0.5) * options.step);
         }
     }
+    // Boolean datapoints reach the aggregator as real true/false values. parseFloat(true) is NaN,
+    // which used to poison the average/total accumulators (and JSON-serializes as null on the wire),
+    // so getHistory with the DEFAULT aggregate returned val=null for booleans. Map booleans to 1/0
+    // for the arithmetic modes; min/max/minmax intentionally keep the raw boolean.
+    const numericVal = typeof data.val === 'boolean' ? (data.val ? 1 : 0) : parseFloat(data.val);
     if (options.aggregate === 'max') {
         if (options.processing[index].val.val === null || options.processing[index].val.val < data.val) {
             options.processing[index].val.val = data.val;
@@ -281,14 +286,14 @@ function aggregationLogic(data, index, options) {
         }
     }
     else if (options.aggregate === 'average') {
-        options.processing[index].val.val += parseFloat(data.val);
+        options.processing[index].val.val += numericVal;
         options.averageCount[index]++;
     }
     else if (options.aggregate === 'count') {
         options.averageCount[index]++;
     }
     else if (options.aggregate === 'total') {
-        options.processing[index].val.val += parseFloat(data.val);
+        options.processing[index].val.val += numericVal;
     }
     else if (options.aggregate === 'minmax') {
         if (options.processing[index].min.ts === null) {
@@ -325,7 +330,8 @@ function aggregationLogic(data, index, options) {
         }
     }
     else if (options.aggregate === 'percentile' || options.aggregate === 'quantile') {
-        options.quantileDataPoints[index].push(data.val || 0);
+        // booleans are mapped to 1/0 (see numericVal above); null/undefined keep mapping to 0
+        options.quantileDataPoints[index].push(typeof data.val === 'boolean' ? numericVal : data.val || 0);
         if (options.logDebug && options.log) {
             options.log(`Quantile ${index}: Add ts= ${data.ts} val=${data.val}`);
         }

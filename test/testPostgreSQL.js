@@ -163,8 +163,10 @@ describe(`Test ${__filename}`, function () {
 
     it(`Test ${__filename}: getCounter works on PostgreSQL`, function (done) {
         this.timeout(30000);
-        const counterId = 'sql.0.testCounter';
         const base = Date.now();
+        // Run-unique name so reruns against an existing database never inherit border rows into the
+        // counter interpolation (getCounterDiff's border subqueries have no age limit).
+        const counterId = `sql.0.testCounterPg${base}`;
 
         objects.setObject(
             counterId,
