@@ -193,6 +193,20 @@
                     "lg": 4,
                     "xl": 4
                 },
+                "pgWriteWindow": {
+                    "newLine": true,
+                    "type": "number",
+                    "hidden": "data.dbtype !== 'postgresql'",
+                    "label": "Write window (ms)",
+                    "help": "0: every value is written at once, as before. Otherwise the values of all datapoints are collected for this time and written in one transaction: far fewer commits, less disk load and wear. A normal stop writes the collected values; if the adapter or the host crashes, the values of up to one window are lost.",
+                    "min": 0,
+                    "max": 60000,
+                    "xs": 12,
+                    "sm": 12,
+                    "md": 4,
+                    "lg": 4,
+                    "xl": 4
+                },
                 "pgSynchronousCommitOff": {
                     "newLine": true,
                     "type": "checkbox",

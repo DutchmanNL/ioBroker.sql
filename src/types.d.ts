@@ -94,6 +94,7 @@ export interface SqlAdapterConfigTyped {
     changesMinDelta: number;
     writeNulls: boolean;
     doNotCreateDatabase: boolean;
+    pgWriteWindow: number;
     pgSynchronousCommitOff: boolean;
     maxLength: number;
     blockTime: number;
@@ -142,6 +143,7 @@ export interface SqlAdapterConfig extends SqlAdapterConfigTyped {
     changesMinDelta: number | string;
     writeNulls: boolean;
     doNotCreateDatabase: boolean;
+    pgWriteWindow: number | string;
     pgSynchronousCommitOff: boolean;
     maxLength: number | string;
     blockTime: number | string;

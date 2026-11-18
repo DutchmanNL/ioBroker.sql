@@ -30,6 +30,7 @@ You can leave port 0 if the default port is desired.
 - **Allow parallel requests**: Allow simultaneous SQL requests to DB.
 - **Statistics tab**: lists every ID in the database with its storage type, status (logged / logging off / state deleted), number of values, estimated size and the covered time range. The **Clean up** button first shows what would be deleted and removes it only after confirmation. States that still exist but merely have logging switched off are excluded unless you tick the checkbox, because their history is still reachable and may be wanted.
 - **Do not create database**: Activate this option if a database already created (e.g. by administrator) and the ioBroker-user does not have enough rights to create a DB.
+- **Write window (ms)**: PostgreSQL only, 0 by default. 0 writes every value at once, as before. With e.g. 500, the values of all datapoints are collected for 500 ms and written in one transaction, so 70 values per second cost 2 commits instead of 70: much less disk I/O and wear. A datapoint is written earlier when its buffer passes its own "max length" or 500 values. Reads see the collected values, and a normal stop writes them; if the adapter or the host crashes, the values of up to one window are lost. If the transaction fails, every datapoint is written on its own as without the window.
 - **Relax PostgreSQL commit durability**: PostgreSQL only, off by default. Runs the adapter's own connections with `synchronous_commit=off`, so a commit no longer waits until the write-ahead log is flushed to disk. This strongly reduces disk I/O and wear, e.g. on SD cards and consumer SSDs. If the PostgreSQL server crashes, the values stored in the last few hundred milliseconds can be lost; unlike `fsync=off` this setting cannot corrupt the database. Other clients of the same server are not affected.
 
 ## Default Settings
@@ -664,6 +665,9 @@ sendTo('sql.0', 'getEnabledDPs', {}, function (result) {
 -->
 
 ## Changelog
+### **WORK IN PROGRESS**
+* (@DutchmanNL) PostgreSQL: new opt-in setting "Write window (ms)" collects the values of all datapoints for that time and writes them in one transaction instead of one per value, which strongly reduces commits and disk I/O. 0 (the default) keeps the current behaviour (#516)
+
 ### 4.5.1 (2026-11-17)
 * (@Schimi1983) "Clean up" no longer deletes the history of datapoints that are logged under an alias name, and stops with an error instead of deleting everything when the object database cannot be read (#587)
 * (@Schimi1983) MySQL/MariaDB: new tables use `utf8mb4`, so values, IDs and sources with emojis are stored instead of failing, and the names compare case-sensitively (`utf8mb4_bin`), also in a database created by a hoster. Existing tables are not changed; the README explains how to convert them (#588)

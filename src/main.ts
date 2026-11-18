@@ -53,7 +53,14 @@ import type { SQLClientPool, PoolConfig } from './lib/sql-client-pool';
 import type SQLClient from './lib/sql-client';
 import type { IobDataEntry } from './lib/types';
 import { counterTypeMismatch, formatError, isConnectionError } from './lib/errors';
-import { MAX_KEPT_ROWS, MAX_REQUEUED_ROWS, requeue, requeueCap, splitBatch } from './lib/write-buffer';
+import {
+    MAX_KEPT_ROWS,
+    MAX_REQUEUED_ROWS,
+    ROWS_PER_STATEMENT,
+    requeue,
+    requeueCap,
+    splitBatch,
+} from './lib/write-buffer';
 
 export interface IobDataEntryEx extends Omit<IobDataEntry, 'val'> {
     val: string | boolean | number | null;
@@ -378,6 +385,10 @@ export class SqlAdapter extends Adapter {
     private testConnectTimeout: NodeJS.Timeout | null = null;
     private dpOverviewTimeout: NodeJS.Timeout | null = null;
     private bufferChecker: NodeJS.Timeout | null = null;
+    /** Writes the buffers of all datapoints every `pgWriteWindow` ms (#516) */
+    #writeWindowTimer: NodeJS.Timeout | null = null;
+    /** The transaction of the last write window is still running */
+    #windowWriting = false;
     private activeConnections = 0;
     private poolBorrowGuard: ((err: Error | null | undefined, client?: SQLClient) => void)[] = []; // required until https://github.com/intellinote/sql-client/issues/7 is fixed
     private readonly logConnectionUsage = true;
@@ -1549,6 +1560,10 @@ export class SqlAdapter extends Adapter {
             clearInterval(this.bufferChecker);
             this.bufferChecker = null;
         }
+        if (this.#writeWindowTimer) {
+            clearInterval(this.#writeWindowTimer);
+            this.#writeWindowTimer = null;
+        }
 
         if (this.finished) {
             if (callback) {
@@ -2688,7 +2703,13 @@ export class SqlAdapter extends Adapter {
 
             const _settings = this.sqlDPs[id].config || {};
             const maxLength = _settings.maxLength !== undefined ? _settings.maxLength : this.config.maxLength || 0;
-            if ((cb || (_settings && this.sqlDPs[id].list.length > maxLength)) && !storeInCacheOnly) {
+            const buffered = this.sqlDPs[id].list.length;
+            // With a write window, its timer writes the buffers. A datapoint is only written earlier when its
+            // buffer passes its own "max length", or fills a whole INSERT.
+            const full = this.#writeWindowOn()
+                ? (maxLength > 0 && buffered > maxLength) || buffered >= ROWS_PER_STATEMENT
+                : buffered > maxLength;
+            if ((cb || (_settings && full)) && !storeInCacheOnly) {
                 this.storeCached(id, cb);
             } else if (cb && storeInCacheOnly) {
                 setImmediate(cb);
@@ -2836,33 +2857,7 @@ export class SqlAdapter extends Adapter {
                 count++;
                 this.#writesInFlight++;
                 this.pushValuesIntoDB(id, this.sqlDPs[id].inFlight[inFlightId], (err, unwritten): void => {
-                    this.#writeFinished();
-                    if (this.sqlDPs[id]?.inFlight?.[inFlightId]) {
-                        delete this.sqlDPs[id].inFlight[inFlightId];
-                    }
-                    if (err && unwritten?.length) {
-                        const kept = this.#keepForRetry(id, unwritten);
-                        if (kept) {
-                            // the other callbacks of a merged insert (#queueInsert) get the same error
-                            // object, but not the rows: they are kept with this one
-                            this.#keptErrors.add(err);
-                            // storeState answers with this error: a caller that sends the values again
-                            // would store them twice where the table has no unique key
-                            err = new Error(
-                                `${err.message}; ${kept} values are kept and written with the next write, do not send them again`,
-                                { cause: err },
-                            );
-                        }
-                    } else if (err && this.#keptErrors.has(err)) {
-                        // rows of this flush were merged into an insert whose rows are kept (see above)
-                        err = new Error(
-                            `${err.message}; the values are kept and written with the next write, do not send them again`,
-                            { cause: err },
-                        );
-                    } else if (!err && this.#keptDropped) {
-                        // the database is back before the next warning was due: report the dropped rows now
-                        this.log.warn(`While the database was not reachable, ${this.#takeDroppedText()}`);
-                    }
+                    err = this.#bufferWritten(id, inFlightId, err, unwritten);
                     if (!--count && cb) {
                         cb?.(err);
                         cb = null;
@@ -2876,6 +2871,169 @@ export class SqlAdapter extends Adapter {
         if (!count && cb) {
             cb();
         }
+    }
+
+    /**
+     * After the write of a buffer that storeCached() or the write window moved to `inFlight`: the rows leave
+     * `inFlight`, rows that could not be written are kept for the next write, and the stop learns that this
+     * write is done.
+     *
+     * @param id the datapoint
+     * @param inFlightId the key of the rows in `inFlight`
+     * @param err the error of the write
+     * @param unwritten the rows that were not written, if a retry makes sense
+     * @returns the error to report to the caller
+     */
+    #bufferWritten(
+        id: string,
+        inFlightId: string,
+        err?: Error | null,
+        unwritten?: InsertRow[],
+    ): Error | null | undefined {
+        this.#writeFinished();
+        if (this.sqlDPs[id]?.inFlight?.[inFlightId]) {
+            delete this.sqlDPs[id].inFlight[inFlightId];
+        }
+        if (err && unwritten?.length) {
+            const kept = this.#keepForRetry(id, unwritten);
+            if (kept) {
+                // the other callbacks of a merged insert (#queueInsert) get the same error
+                // object, but not the rows: they are kept with this one
+                this.#keptErrors.add(err);
+                // storeState answers with this error: a caller that sends the values again
+                // would store them twice where the table has no unique key
+                err = new Error(
+                    `${err.message}; ${kept} values are kept and written with the next write, do not send them again`,
+                    { cause: err },
+                );
+            }
+        } else if (err && this.#keptErrors.has(err)) {
+            // rows of this flush were merged into an insert whose rows are kept (see above)
+            err = new Error(
+                `${err.message}; the values are kept and written with the next write, do not send them again`,
+                {
+                    cause: err,
+                },
+            );
+        } else if (!err && this.#keptDropped) {
+            // the database is back before the next warning was due: report the dropped rows now
+            this.log.warn(`While the database was not reachable, ${this.#takeDroppedText()}`);
+        }
+        return err;
+    }
+
+    /** Whether values are collected for a write window instead of written at once (#516, opt-in) */
+    #writeWindowOn(): boolean {
+        return this.config.dbtype === 'postgresql' && this.config.pgWriteWindow > 0;
+    }
+
+    /**
+     * Write the buffers of all datapoints in one transaction, every `pgWriteWindow` ms (#516).
+     *
+     * The rows move to `inFlight` like in storeCached(), so reads still see them and the stop waits for them.
+     * If the transaction fails, it is rolled back and every datapoint is written on its own, as without the
+     * window, with the usual retry of the rows that could not be written. A datapoint with a bad row then
+     * fails alone instead of taking the others along.
+     */
+    #writeWindow(): void {
+        if (this.#windowWriting) {
+            // the transaction of the last window is still running: these rows go with the next one
+            return;
+        }
+        if (!this.multiRequests) {
+            // without parallel requests every write goes through the task queue
+            this.storeCached();
+            return;
+        }
+
+        const writes: { id: string; index: number; inFlightId: string; rows: InsertRow[] }[] = [];
+        for (const id in this.sqlDPs) {
+            if (!Object.prototype.hasOwnProperty.call(this.sqlDPs, id) || !this.sqlDPs[id]?.list?.length) {
+                continue;
+            }
+            const rows = this.sqlDPs[id].list;
+            const inFlightId = `${id}_${Date.now()}_${Math.random()}`;
+            this.sqlDPs[id].inFlight ||= {};
+            this.sqlDPs[id].inFlight[inFlightId] = rows;
+            this.sqlDPs[id].list = [];
+            this.#releaseKept(id);
+            this.#writesInFlight++;
+            writes.push({ id, index: this.sqlDPs[id].index, inFlightId, rows });
+        }
+        if (!writes.length) {
+            return;
+        }
+        this.#windowWriting = true;
+        const startTime = Date.now();
+
+        const writeEach = (): void => {
+            this.#windowWriting = false;
+            for (const write of writes) {
+                // with the index taken when the rows were collected: the datapoint may be gone by now
+                this._insertValuesIntoDB(write.rows, write.index, write.id, (err, unwritten) => {
+                    this.#bufferWritten(write.id, write.inFlightId, err, unwritten);
+                });
+            }
+        };
+
+        let statements: SqlStatement[];
+        try {
+            statements = ['BEGIN'];
+            for (const write of writes) {
+                for (const group of splitBatch(write.rows)) {
+                    statements.push(...this.sqlFuncs!.insert(this.config.dbname, write.index, group));
+                }
+            }
+            statements.push('COMMIT');
+        } catch (e) {
+            this.log.debug(
+                `The write window cannot build its transaction, every datapoint is written on its own: ${e}`,
+            );
+            writeEach();
+            return;
+        }
+
+        this.borrowClientFromPool((err, client) => {
+            if (err || !client) {
+                this.returnClientToPool(client);
+                writeEach();
+                return;
+            }
+            const run = (i: number): void => {
+                if (i >= statements.length) {
+                    this.returnClientToPool(client);
+                    this.#windowWriting = false;
+                    let values = 0;
+                    for (const write of writes) {
+                        values += write.rows.length;
+                    }
+                    this.log.debug(
+                        `Wrote ${values} values of ${writes.length} datapoints in one transaction in ${Date.now() - startTime}ms`,
+                    );
+                    for (const write of writes) {
+                        this.checkRetention(write.id);
+                        this.#bufferWritten(write.id, write.inFlightId, null);
+                    }
+                    return;
+                }
+                this.#debugStatement(statements[i]);
+                client.execute(statements[i], execErr => {
+                    if (!execErr) {
+                        run(i + 1);
+                        return;
+                    }
+                    this.log.debug(
+                        `The transaction of the write window failed, every datapoint is written on its own: ${execErr}`,
+                    );
+                    // the connection must not go back to the pool inside an aborted transaction
+                    client.execute('ROLLBACK', () => {
+                        this.returnClientToPool(client);
+                        writeEach();
+                    });
+                });
+            };
+            run(0);
+        });
     }
 
     pushValuesIntoDB(id: string, list: InsertRow[], cb?: InsertCallback): void {
@@ -5004,6 +5162,8 @@ export class SqlAdapter extends Adapter {
             config.writeNulls = true;
         }
 
+        // ms; 0 writes every value at once, as before. At most a minute of values waits in RAM.
+        config.pgWriteWindow = Math.min(60_000, Math.max(0, parseInt(config.pgWriteWindow as string, 10) || 0));
         config.pgSynchronousCommitOff = !!config.pgSynchronousCommitOff;
 
         config.retention = parseInt(config.retention as string, 10) || 0;
@@ -5349,6 +5509,9 @@ export class SqlAdapter extends Adapter {
 
                     // store all buffered data every 10 minutes to not lost the data
                     this.bufferChecker = setInterval(() => this.storeCached(), 10 * 60000);
+                    if (this.#writeWindowOn()) {
+                        this.#writeWindowTimer = setInterval(() => this.#writeWindow(), this.config.pgWriteWindow);
+                    }
                 });
             });
         }

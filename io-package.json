@@ -262,6 +262,7 @@
     "changesMinDelta": 0,
     "writeNulls": true,
     "doNotCreateDatabase": false,
+    "pgWriteWindow": 0,
     "pgSynchronousCommitOff": false,
     "maxLength": 0,
     "blockTime": 0,
