@@ -205,6 +205,18 @@
                     "lg": 8,
                     "xl": 8
                 },
+                "pgAggregateInDatabase": {
+                    "newLine": true,
+                    "type": "checkbox",
+                    "hidden": "data.dbtype !== 'postgresql'",
+                    "label": "Aggregate in PostgreSQL",
+                    "help": "Charts with min, max, min/max, average or total of one numeric datapoint are calculated with a few rows per interval that PostgreSQL selects and adds up, instead of all values of the range. The result stays the same.",
+                    "xs": 12,
+                    "sm": 12,
+                    "md": 8,
+                    "lg": 8,
+                    "xl": 8
+                },
                 "_testConnection": {
                     "newLine": true,
                     "variant": "contained",

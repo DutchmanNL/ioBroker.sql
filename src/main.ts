@@ -25,6 +25,7 @@ import type {
 import * as MSSQL from './lib/mssql';
 import * as MySQL from './lib/mysql';
 import * as PostgreSQL from './lib/postgresql';
+import type { AggregatedHistoryRow, DbAggregate } from './lib/postgresql';
 import * as SQLite from './lib/sqlite';
 
 import { MSSQLClientPool, MSSQLClient, type MSSQLOptions } from './lib/mssql-client';
@@ -108,6 +109,20 @@ type SQLFunc = {
         table: string,
         options: ioBroker.GetHistoryOptions & { index: number | null },
     ) => SqlStatement;
+    /** PostgreSQL only: an aggregated read with the heavy part done in the database (#516) */
+    getAggregatedHistory?: (
+        dbName: string,
+        table: string,
+        options: {
+            index: number;
+            start: number;
+            end: number;
+            step: number;
+            aggregate: DbAggregate;
+            round?: number;
+            intervalBorders?: number[];
+        },
+    ) => SqlStatement;
     deleteFromTable: (
         dbName: string,
         table: 'ts_string' | 'ts_number' | 'ts_bool' | 'ts_counter',
@@ -190,6 +205,7 @@ const SQLFuncs: Record<DbType, SQLFunc> = {
         getFromInsert: PostgreSQL.getFromInsert,
         getCounterDiff: PostgreSQL.getCounterDiff,
         getHistory: PostgreSQL.getHistory,
+        getAggregatedHistory: PostgreSQL.getAggregatedHistory,
         deleteFromTable: PostgreSQL.deleteFromTable,
         update: PostgreSQL.update,
         getRawEntries: PostgreSQL.getRawEntries,
@@ -294,6 +310,8 @@ const MAX_RAW_ENTRIES = 5000;
 const REPEATED_ERROR_INTERVAL = 3_600_000;
 /** Rows per batch when an aggregated PostgreSQL read is streamed instead of buffered */
 const STREAM_BATCH_SIZE = 2000;
+/** Aggregates that PostgreSQL prepares when "pgAggregateInDatabase" is set */
+const DB_AGGREGATES: readonly string[] = ['min', 'max', 'minmax', 'average', 'total'] satisfies DbAggregate[];
 
 type SQLPointConfig = {
     realId: string;
@@ -3566,6 +3584,127 @@ export class SqlAdapter extends Adapter {
         });
     }
 
+    /**
+     * Whether PostgreSQL prepares an aggregated read of one numeric datapoint (#516, opt-in). The other
+     * aggregates need every value of an interval (`count` its number of rows) and stay with the adapter.
+     *
+     * @param options options of the read
+     * @param type storage type of the datapoint
+     * @param cachedValues number of values of this datapoint in the RAM cache
+     * @param includesInFlightData whether values are being written right now
+     */
+    #canAggregateInDatabase(
+        options: ioBroker.GetHistoryOptions & { id: string | null; index: number | null },
+        type: 0 | 1 | 2 | undefined,
+        cachedValues: number,
+        includesInFlightData: boolean,
+    ): boolean {
+        return (
+            this.config.dbtype === 'postgresql' &&
+            this.config.pgAggregateInDatabase &&
+            !!this.sqlFuncs?.getAggregatedHistory &&
+            // 0 === number
+            type === 0 &&
+            options.index !== null &&
+            !!options.start &&
+            !!options.end &&
+            !cachedValues &&
+            !includesInFlightData &&
+            DB_AGGREGATES.includes(options.aggregate as string)
+        );
+    }
+
+    /**
+     * Aggregated read of one numeric datapoint, prepared by PostgreSQL (#516): the database sends a few rows
+     * per interval instead of all of them (see getAggregatedHistory() in lib/postgresql.ts), and
+     * `aggregation()` and `finishAggregation()` calculate the answer from them as for every other read.
+     * If the database cannot answer, the read goes the usual way.
+     *
+     * @param table table of the datapoint
+     * @param options options of the read
+     * @param msg the request
+     * @param startTime when the request arrived
+     * @param debugLog whether to log the aggregation steps
+     * @param logId prefix of the debug log
+     * @param readInAdapter the usual read, used when the database cannot answer
+     */
+    #getAggregatedDataInDatabase(
+        table: TableName,
+        options: ioBroker.GetHistoryOptions & { id: string | null; index: number | null },
+        msg: ioBroker.Message,
+        startTime: number,
+        debugLog: boolean,
+        logId: string,
+        readInAdapter: () => void,
+    ): void {
+        // like sendResponse(): the step of the request, before initAggregate() calculates one
+        const responseStep = options.step || 0;
+        const log = debugLog ? (text: string): void => this.log.debug(`${logId}: ${text}`) : undefined;
+
+        let aggOptions: InternalHistoryOptions;
+        let query: SqlStatement;
+        try {
+            // On a copy: if the database cannot answer, the usual read starts from the untouched options
+            aggOptions = initAggregate({ ...options }, options.id!, undefined, log);
+            query = this.sqlFuncs!.getAggregatedHistory!(this.config.dbname, table, {
+                index: options.index!,
+                start: aggOptions.start!,
+                end: aggOptions.end!,
+                step: aggOptions.step!,
+                aggregate: aggOptions.aggregate as DbAggregate,
+                round: options.round,
+                intervalBorders: aggOptions.timeIntervals ? aggOptions.intervalBorders : undefined,
+            });
+        } catch {
+            // the usual read answers the same request with its own error
+            readInAdapter();
+            return;
+        }
+        this.#debugStatement(query);
+
+        this.borrowClientFromPool((err, client) => {
+            if (err || !client) {
+                this.returnClientToPool(client);
+                readInAdapter();
+                return;
+            }
+            client.execute<AggregatedHistoryRow>(query, (execErr, rows) => {
+                this.returnClientToPool(client);
+                if (execErr || !rows) {
+                    this.log.warn(`${logId}: PostgreSQL could not aggregate, the adapter does: ${execErr}`);
+                    readInAdapter();
+                    return;
+                }
+                if (!rows.length) {
+                    // the same "No Data" answer as for an empty buffered read
+                    sendResponse(this, msg, options.id!, options, [], startTime);
+                    return;
+                }
+                try {
+                    const { data, stored } = PostgreSQL.toAggregationInput(rows, aggOptions.aggregate as DbAggregate);
+                    // stored values are prepared like the rows of every other read
+                    this.#normalizeRows(stored as (IobDataEntryEx & { date?: Date; id?: string })[], options);
+
+                    aggregation(aggOptions, data as unknown as IobDataEntry[]);
+                    finishAggregation(aggOptions);
+                    const result = aggOptions.result!;
+                    this.log.debug(
+                        `Send after aggregation (in the database): ${result.length} of: ${rows.length} rows in: ${Date.now() - startTime}ms`,
+                    );
+                    this.sendTo(
+                        msg.from,
+                        msg.command,
+                        { result, step: responseStep, sessionId: options.sessionId },
+                        msg.callback,
+                    );
+                } catch (e) {
+                    this.log.warn(`${logId}: PostgreSQL could not aggregate, the adapter does: ${e}`);
+                    readInAdapter();
+                }
+            });
+        });
+    }
+
     getDataFromDB(
         table: TableName,
         options: ioBroker.GetHistoryOptions & { id: string | null; index: number | null },
@@ -3980,18 +4119,34 @@ export class SqlAdapter extends Adapter {
                         });
                     };
 
-                    if (this.#canStream(options, cacheData.length, includesInFlightData)) {
-                        this.#getAggregatedDataStreamed(
+                    const readInAdapter = (): void => {
+                        if (this.#canStream(options, cacheData.length, includesInFlightData)) {
+                            this.#getAggregatedDataStreamed(
+                                dbNames[type],
+                                options,
+                                msg,
+                                startTime,
+                                debugLog,
+                                logId,
+                                readBuffered,
+                            );
+                        } else {
+                            readBuffered();
+                        }
+                    };
+
+                    if (this.#canAggregateInDatabase(options, type, cacheData.length, includesInFlightData)) {
+                        this.#getAggregatedDataInDatabase(
                             dbNames[type],
                             options,
                             msg,
                             startTime,
                             debugLog,
                             logId,
-                            readBuffered,
+                            readInAdapter,
                         );
                     } else {
-                        readBuffered();
+                        readInAdapter();
                     }
                 }
             });
@@ -5190,6 +5345,7 @@ export class SqlAdapter extends Adapter {
         }
 
         config.pgSynchronousCommitOff = !!config.pgSynchronousCommitOff;
+        config.pgAggregateInDatabase = !!config.pgAggregateInDatabase;
 
         config.retention = parseInt(config.retention as string, 10) || 0;
         if (config.retention === -1) {

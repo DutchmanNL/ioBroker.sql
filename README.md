@@ -31,6 +31,7 @@ You can leave port 0 if the default port is desired.
 - **Statistics tab**: lists every ID in the database with its storage type, status (logged / logging off / state deleted), number of values, estimated size and the covered time range. The **Clean up** button first shows what would be deleted and removes it only after confirmation. States that still exist but merely have logging switched off are excluded unless you tick the checkbox, because their history is still reachable and may be wanted.
 - **Do not create database**: Activate this option if a database already created (e.g. by administrator) and the ioBroker-user does not have enough rights to create a DB.
 - **Relax PostgreSQL commit durability**: PostgreSQL only, off by default. Runs the adapter's own connections with `synchronous_commit=off`, so a commit no longer waits until the write-ahead log is flushed to disk. This strongly reduces disk I/O and wear, e.g. on SD cards and consumer SSDs. If the PostgreSQL server crashes, the values stored in the last few hundred milliseconds can be lost; unlike `fsync=off` this setting cannot corrupt the database. Other clients of the same server are not affected.
+- **Aggregate in PostgreSQL**: PostgreSQL only, off by default. A `getHistory` of one numeric datapoint with the aggregate `min`, `max`, `minmax`, `average` or `total` lets the database do the heavy part: per interval it sends only the first, the last, the smallest and the largest value, or the sum and the number of the values. The adapter calculates the answer from these as before, so the result is the same; a chart over a long range no longer moves every stored value to the adapter. The other aggregates are calculated by the adapter as before.
 
 ## Default Settings
 - **Debounce Time** - Protection against unstable values to make sure that only stable values are logged when the value did not change in the defined amount of Milliseconds. ATTENTION: If values change more often than this setting effectively, no value will be logged (because any value is unstable)
@@ -665,6 +666,7 @@ sendTo('sql.0', 'getEnabledDPs', {}, function (result) {
 
 ## Changelog
 ### **WORK IN PROGRESS**
+* (@DutchmanNL) PostgreSQL: new opt-in setting "Aggregate in PostgreSQL". A `getHistory` of one numeric datapoint with `min`, `max`, `minmax`, `average` or `total` gets per interval only the values that decide it, or their sum and number, from the database instead of every stored value. The answer stays the same (#516)
 * (@DutchmanNL) PostgreSQL: an aggregated `getHistory` of one datapoint reads the rows in batches of 2000 (pg-cursor) and aggregates them batch by batch, instead of holding the whole range in memory first. The answer stays the same; without pg-cursor, with pg-native, and for `integralTotal` the values are read as before (#516)
 
 ### 4.5.1 (2026-11-17)

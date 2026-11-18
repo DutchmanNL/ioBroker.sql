@@ -14,6 +14,8 @@ exports.getFromSelect = getFromSelect;
 exports.getFromInsert = getFromInsert;
 exports.getCounterDiff = getCounterDiff;
 exports.getHistory = getHistory;
+exports.getAggregatedHistory = getAggregatedHistory;
+exports.toAggregationInput = toAggregationInput;
 exports.deleteFromTable = deleteFromTable;
 exports.deleteDatapoint = deleteDatapoint;
 exports.update = update;
@@ -239,6 +241,108 @@ function getHistory(_dbName, table, options) {
     }
     query += ';';
     return query;
+}
+/**
+ * Aggregated history read of one numeric datapoint, with the heavy part done by PostgreSQL (#516). The
+ * adapter still calculates the answer with `aggregation()` and `finishAggregation()` of `@iobroker/aggregate`;
+ * the database only sends what decides each interval instead of every row.
+ *
+ * - `min`, `max`, `minmax`: the rows that decide an interval: its first and its last row, and the earliest
+ *   row with the smallest and with the largest value. `aggregation()` reaches the same state of the interval
+ *   for these rows as for all of its rows.
+ * - `average`, `total`: one row per interval with the timestamp of its first row, the sum of its values `s`
+ *   and their number `c`. The values are added in the order of `ts`, one after the other like the loop in
+ *   `aggregation()`, so the sum is the same double.
+ *
+ * Both also return the last row before the start and the first row at or after the end, like getHistory().
+ * Each is one pass over the range without a join, so a wrong row estimate cannot make the plan explode.
+ *
+ * The intervals are the ones of `@iobroker/aggregate`: `floor((ts - start) / step)` in float8 is the same IEEE
+ * calculation as `Math.floor()` in JavaScript, and `String()` writes `step` so that PostgreSQL reads back the
+ * same double. With `intervalBorders`, `width_bucket()` finds the interval with `start <= ts < end`.
+ *
+ * Values are read as the text of the REAL value turned into float8: that is the number the driver's
+ * `parseFloat()` makes of a REAL (widening the REAL directly gives a different one). They are compared and
+ * added like the adapter does: NaN and ±Infinity are gaps like in `toNumber()` of `@iobroker/aggregate`, and
+ * with `round` they are rounded exactly like `Math.round(v * round) / round` (ties towards +Infinity; `round()`
+ * of PostgreSQL rounds them away from zero).
+ *
+ * @param _dbName name of the database (not used by PostgreSQL)
+ * @param table table of the datapoint, `ts_number`
+ * @param options the read, with `start`, `end` and `step` as `initAggregate()` set them
+ * @param options.index id of the datapoint in the database
+ * @param options.start start of the first interval
+ * @param options.end end of the last interval
+ * @param options.step length of an interval
+ * @param options.aggregate one of `DbAggregate`
+ * @param options.round `Math.round(v * round) / round` for every value, if set
+ * @param options.intervalBorders the borders of the intervals from the client, if any
+ */
+function getAggregatedHistory(_dbName, table, options) {
+    const { index, start, end } = options;
+    const range = `id=${index} AND ts >= ${start} AND ts < ${end}`;
+    const interval = options.intervalBorders
+        ? `width_bucket(ts::float8, ARRAY[${options.intervalBorders.map(b => String(b)).join(',')}]::float8[])`
+        : `floor((ts - ${start})::float8 / ${String(options.step)}::float8)`;
+    const raw = '(val::text)::float8';
+    const value = `CASE WHEN val IN ('NaN'::real, 'Infinity'::real, '-Infinity'::real) THEN NULL ELSE ${raw} END`;
+    // one row per stored value: timestamp, interval `b`, the value as the driver reads it `raw`, and `v` to calculate with
+    let values;
+    if (options.round) {
+        const round = `${String(options.round)}::float8`;
+        values =
+            `SELECT ts, b, raw, (CASE WHEN y - floor(y) >= 0.5 THEN ceil(y) ELSE floor(y) END) / ${round} AS v ` +
+                `FROM (SELECT ts, ${interval} AS b, ${raw} AS raw, ${value} * ${round} AS y FROM ${table} WHERE ${range}) r`;
+    }
+    else {
+        values = `SELECT ts, ${interval} AS b, ${raw} AS raw, ${value} AS v FROM ${table} WHERE ${range}`;
+    }
+    const before = `SELECT ts, ${raw} AS val FROM ${table} WHERE id=${index} AND ts < ${start} ORDER BY ts DESC LIMIT 1`;
+    const after = `SELECT ts, ${raw} AS val FROM ${table} WHERE id=${index} AND ts >= ${end} ORDER BY ts ASC LIMIT 1`;
+    if (options.aggregate === 'average' || options.aggregate === 'total') {
+        return (`SELECT ts, val, NULL::float8 AS s, NULL::bigint AS c FROM ((${before}) UNION ALL (${after})) borders` +
+            ` UNION ALL SELECT min(ts), NULL::float8, sum(v ORDER BY ts), count(v) FROM (${values}) x GROUP BY b` +
+            ' ORDER BY ts ASC;');
+    }
+    // Per interval [ts, raw] of the first and the last row, [v, ts, raw] of the earliest smallest value and
+    // [v, -ts, raw] of the earliest largest one. A float8 holds every ts exactly.
+    const decisive = 'SELECT min(ARRAY[ts::float8, raw]) AS f, max(ARRAY[ts::float8, raw]) AS l,' +
+        ' min(ARRAY[v, ts::float8, raw]) FILTER (WHERE v IS NOT NULL) AS mn,' +
+        ' max(ARRAY[v, -(ts::float8), raw]) FILTER (WHERE v IS NOT NULL) AS mx' +
+        ` FROM (${values}) x GROUP BY b`;
+    return ('SELECT DISTINCT ts, val FROM (' +
+        'SELECT unnest(ARRAY[f[1], l[1], mn[2], -(mx[2])])::bigint AS ts, unnest(ARRAY[f[2], l[2], mn[3], mx[3]]) AS val' +
+        ` FROM (${decisive}) g) d WHERE ts IS NOT NULL` +
+        ` UNION ALL (${before}) UNION ALL (${after}) ORDER BY ts ASC;`);
+}
+/**
+ * The input for `aggregation()` from the rows of getAggregatedHistory(), in the order of `ts`.
+ *
+ * @param rows rows of getAggregatedHistory()
+ * @param aggregate the aggregate of the read
+ * @returns `data` for `aggregation()`, and `stored`, the entries of `data` that are stored values: they still
+ * have to be prepared like every row of a read (ts as number, rounding). The other entries carry the average
+ * or the total of their interval, calculated from values that were already rounded.
+ */
+function toAggregationInput(rows, aggregate) {
+    const data = [];
+    const stored = [];
+    for (const row of rows) {
+        if (row.c === undefined || row.c === null) {
+            const entry = { ts: row.ts, val: row.val };
+            stored.push(entry);
+            data.push(entry);
+        }
+        else {
+            const count = parseInt(row.c, 10);
+            let val = null;
+            if (count) {
+                val = aggregate === 'average' ? row.s / count : row.s;
+            }
+            data.push({ ts: parseInt(row.ts, 10), val });
+        }
+    }
+    return { data, stored };
 }
 function deleteFromTable(_dbName, table, index, start, end) {
     let query = `DELETE FROM ${table} WHERE`;

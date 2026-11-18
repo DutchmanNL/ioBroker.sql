@@ -95,6 +95,7 @@ export interface SqlAdapterConfigTyped {
     writeNulls: boolean;
     doNotCreateDatabase: boolean;
     pgSynchronousCommitOff: boolean;
+    pgAggregateInDatabase: boolean;
     maxLength: number;
     blockTime: number;
     debounceTime: number;
@@ -143,6 +144,7 @@ export interface SqlAdapterConfig extends SqlAdapterConfigTyped {
     writeNulls: boolean;
     doNotCreateDatabase: boolean;
     pgSynchronousCommitOff: boolean;
+    pgAggregateInDatabase: boolean;
     maxLength: number | string;
     blockTime: number | string;
     debounceTime: number | string;
